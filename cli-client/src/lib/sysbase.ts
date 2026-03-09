@@ -7,27 +7,29 @@ const SYSBASE_META_DIR = path.join(SYSBASE_DIR, ".meta")
 const PROJECT_META_FILE = path.join(SYSBASE_META_DIR, "project.json")
 const MODELS_META_FILE = path.join(SYSBASE_META_DIR, "models.json")
 
-// Auth + chat state stored globally (in user home, not per-project)
 const SYSFLOW_HOME = path.join(os.homedir(), ".sysflow")
 const AUTH_FILE = path.join(SYSFLOW_HOME, "auth.json")
 const CHAT_FILE = path.join(SYSBASE_META_DIR, "chat.json")
 
-export const MODELS = [
+export interface ModelDef {
+  id: string
+  label: string
+  desc: string
+  visible: boolean
+}
+
+export const MODELS: ModelDef[] = [
   { id: "openrouter-auto", label: "Auto (OpenRouter)", desc: "Best available model via OpenRouter", visible: true },
   { id: "gemini-flash",    label: "Gemini 2.5 Flash",  desc: "Fast & free — Google AI direct", visible: true }
-  // Hidden for now — will enable when ready:
-  // { id: "gemini-pro",      label: "Gemini Pro",        desc: "Stronger — 5 RPM / 100 RPD", visible: false },
-  // { id: "claude-sonnet-4", label: "Claude Sonnet 4",   desc: "Balanced speed and intelligence", visible: false },
-  // { id: "claude-opus-4",   label: "Claude Opus 4",     desc: "Maximum intelligence", visible: false },
 ]
 
 export const VISIBLE_MODELS = MODELS.filter((m) => m.visible !== false)
 
-export function getSysbasePath() {
+export function getSysbasePath(): string {
   return SYSBASE_DIR
 }
 
-export async function ensureSysbase() {
+export async function ensureSysbase(): Promise<void> {
   const dirs = [
     SYSBASE_DIR,
     path.join(SYSBASE_DIR, "plans"),
@@ -46,26 +48,11 @@ export async function ensureSysbase() {
   const defaults = [
     {
       file: PROJECT_META_FILE,
-      content: JSON.stringify(
-        {
-          defaultModel: "openrouter-auto",
-          initializedAt: new Date().toISOString(),
-          cwd: process.cwd()
-        },
-        null,
-        2
-      )
+      content: JSON.stringify({ defaultModel: "openrouter-auto", initializedAt: new Date().toISOString(), cwd: process.cwd() }, null, 2)
     },
     {
       file: MODELS_META_FILE,
-      content: JSON.stringify(
-        {
-          available: MODELS.map((m) => m.id),
-          selected: "openrouter-auto"
-        },
-        null,
-        2
-      )
+      content: JSON.stringify({ available: MODELS.map((m) => m.id), selected: "openrouter-auto" }, null, 2)
     }
   ]
 
@@ -78,14 +65,14 @@ export async function ensureSysbase() {
   }
 }
 
-export async function getSelectedModel() {
+export async function getSelectedModel(): Promise<string> {
   await ensureSysbase()
   const raw = await fs.readFile(MODELS_META_FILE, "utf8")
   const data = JSON.parse(raw)
   return data.selected || "swe"
 }
 
-export async function setSelectedModel(model) {
+export async function setSelectedModel(model: string): Promise<void> {
   await ensureSysbase()
   const valid = MODELS.find((m) => m.id === model)
   if (!valid) {
@@ -99,14 +86,14 @@ export async function setSelectedModel(model) {
   await fs.writeFile(MODELS_META_FILE, JSON.stringify(data, null, 2), "utf8")
 }
 
-export async function getReasoningEnabled() {
+export async function getReasoningEnabled(): Promise<boolean> {
   await ensureSysbase()
   const raw = await fs.readFile(MODELS_META_FILE, "utf8")
   const data = JSON.parse(raw)
   return data.reasoning !== false
 }
 
-export async function setReasoningEnabled(enabled) {
+export async function setReasoningEnabled(enabled: boolean): Promise<void> {
   await ensureSysbase()
   const raw = await fs.readFile(MODELS_META_FILE, "utf8")
   const data = JSON.parse(raw)
@@ -114,18 +101,16 @@ export async function setReasoningEnabled(enabled) {
   await fs.writeFile(MODELS_META_FILE, JSON.stringify(data, null, 2), "utf8")
 }
 
-// ─── Auth persistence (global, in ~/.sysflow/auth.json) ───
-
-async function ensureSysflowHome() {
+async function ensureSysflowHome(): Promise<void> {
   await fs.mkdir(SYSFLOW_HOME, { recursive: true })
 }
 
-export async function saveAuthToken(token, user) {
+export async function saveAuthToken(token: string, user: Record<string, unknown>): Promise<void> {
   await ensureSysflowHome()
   await fs.writeFile(AUTH_FILE, JSON.stringify({ token, user, savedAt: new Date().toISOString() }, null, 2), "utf8")
 }
 
-export async function getAuthToken() {
+export async function getAuthToken(): Promise<string | null> {
   try {
     const raw = await fs.readFile(AUTH_FILE, "utf8")
     const data = JSON.parse(raw)
@@ -135,7 +120,7 @@ export async function getAuthToken() {
   }
 }
 
-export async function getAuthUser() {
+export async function getAuthUser(): Promise<Record<string, unknown> | null> {
   try {
     const raw = await fs.readFile(AUTH_FILE, "utf8")
     const data = JSON.parse(raw)
@@ -145,7 +130,7 @@ export async function getAuthUser() {
   }
 }
 
-export async function clearAuth() {
+export async function clearAuth(): Promise<void> {
   try {
     await fs.unlink(AUTH_FILE)
   } catch {
@@ -153,14 +138,12 @@ export async function clearAuth() {
   }
 }
 
-// ─── Chat persistence (per-project, in sysbase/.meta/chat.json) ───
-
-export async function saveActiveChat(chatUid, title) {
+export async function saveActiveChat(chatUid: string, title: string): Promise<void> {
   await ensureSysbase()
   await fs.writeFile(CHAT_FILE, JSON.stringify({ chatUid, title, savedAt: new Date().toISOString() }, null, 2), "utf8")
 }
 
-export async function getActiveChat() {
+export async function getActiveChat(): Promise<string | null> {
   try {
     const raw = await fs.readFile(CHAT_FILE, "utf8")
     const data = JSON.parse(raw)
@@ -170,7 +153,7 @@ export async function getActiveChat() {
   }
 }
 
-export async function getActiveChatInfo() {
+export async function getActiveChatInfo(): Promise<Record<string, unknown> | null> {
   try {
     const raw = await fs.readFile(CHAT_FILE, "utf8")
     return JSON.parse(raw)
@@ -179,7 +162,7 @@ export async function getActiveChatInfo() {
   }
 }
 
-export async function clearActiveChat() {
+export async function clearActiveChat(): Promise<void> {
   try {
     await fs.unlink(CHAT_FILE)
   } catch {
