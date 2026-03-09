@@ -8,15 +8,20 @@ import { executeTool } from "./executor.js"
 import { scanDirectoryTree, readFileTool, computeLineDiff } from "./tools.js"
 import { ensureActiveChat } from "../commands/chats.js"
 
-function sleep(ms) {
+interface ServerError extends Error {
+  code?: string
+  plan?: string
+}
+
+function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-function thinkTime() {
+function thinkTime(): number {
   return 800 + Math.floor(Math.random() * 1400)
 }
 
-async function typeReasoning(text) {
+async function typeReasoning(text: string): Promise<void> {
   const prefix = chalk.dim("    ")
   process.stdout.write(prefix)
 
@@ -40,12 +45,12 @@ async function typeReasoning(text) {
   await sleep(300 + Math.floor(Math.random() * 200))
 }
 
-function formatToolLabel(tool, args) {
+function formatToolLabel(tool: string, args: Record<string, unknown>): string | null {
   switch (tool) {
     case "read_file":
       return chalk.blue("read") + " " + args.path
     case "batch_read":
-      return null // handled separately
+      return null
     case "write_file":
       return chalk.blue("create") + " " + args.path
     case "edit_file":
@@ -67,14 +72,13 @@ function formatToolLabel(tool, args) {
   }
 }
 
-function isHiddenStep(tool) {
+function isHiddenStep(tool: string): boolean {
   return tool === "list_directory"
 }
 
-function resolveFileMentions(prompt, cwd) {
-  // Match @filepath patterns (e.g. @src/app.js, @package.json)
-  const mentions = []
-  const resolved = prompt.replace(/@([\w./-]+)/g, (match, filePath) => {
+function resolveFileMentions(prompt: string, cwd: string): { prompt: string; mentions: Array<{ path: string; absolute: string }> } {
+  const mentions: Array<{ path: string; absolute: string }> = []
+  const resolved = prompt.replace(/@([\w./-]+)/g, (_match, filePath: string) => {
     const absolute = path.resolve(cwd, filePath)
     mentions.push({ path: filePath, absolute })
     return filePath
@@ -82,10 +86,15 @@ function resolveFileMentions(prompt, cwd) {
   return { prompt: resolved, mentions }
 }
 
-export async function runAgent({ prompt, command = null, model = null }) {
+interface RunAgentParams {
+  prompt: string
+  command?: string | null
+  model?: string | null
+}
+
+export async function runAgent({ prompt, command = null, model = null }: RunAgentParams): Promise<Record<string, unknown> | undefined> {
   await ensureSysbase()
 
-  // Require login before prompting
   const authToken = await getAuthToken()
   if (!authToken) {
     console.log("")
@@ -99,7 +108,6 @@ export async function runAgent({ prompt, command = null, model = null }) {
   const selectedModel = model || (await getSelectedModel())
   const hasReasoning = await getReasoningEnabled()
 
-  // Ensure there's an active chat session (auto-creates if logged in)
   const chatUid = await ensureActiveChat()
   if (!chatUid) {
     console.log("")
@@ -109,11 +117,9 @@ export async function runAgent({ prompt, command = null, model = null }) {
     return
   }
 
-  // Resolve @file mentions
   const { prompt: cleanPrompt, mentions } = resolveFileMentions(prompt, process.cwd())
 
-  // Read mentioned files
-  const mentionedFiles = []
+  const mentionedFiles: Array<{ path: string; content: string }> = []
   for (const m of mentions) {
     try {
       const content = await readFileTool(m.absolute)
@@ -123,7 +129,6 @@ export async function runAgent({ prompt, command = null, model = null }) {
     }
   }
 
-  // Scan directory tree and send it with the initial request
   const dirTree = await scanDirectoryTree(process.cwd())
 
   console.log("")
@@ -135,7 +140,7 @@ export async function runAgent({ prompt, command = null, model = null }) {
     color: "cyan"
   }).start()
 
-  let response
+  let response: Record<string, unknown>
   try {
     response = await callServer({
       type: "user_message",
@@ -148,16 +153,13 @@ export async function runAgent({ prompt, command = null, model = null }) {
       directoryTree: dirTree,
       mentionedFiles,
       chatUid: chatUid || undefined,
-      client: {
-        platform: os.platform(),
-        arch: os.arch()
-      }
+      client: { platform: os.platform(), arch: os.arch() }
     })
   } catch (err) {
     spinner.stop()
-    if (err.code === "USAGE_LIMIT") {
+    if ((err as ServerError).code === "USAGE_LIMIT") {
       console.log("")
-      console.log(chalk.yellow("  ⚠ " + err.message))
+      console.log(chalk.yellow("  ⚠ " + (err as Error).message))
       console.log("")
       console.log(chalk.dim("  Run ") + chalk.cyan("sys billing") + chalk.dim(" to upgrade your plan"))
       console.log("")
@@ -168,11 +170,11 @@ export async function runAgent({ prompt, command = null, model = null }) {
 
   let stepCount = 0
   let taskShown = false
-  let taskSteps = []
-  const completedSteps = new Set()
+  let taskSteps: Array<{ id: string; label: string }> = []
+  const completedSteps = new Set<string>()
   let consecutiveErrors = 0
   const MAX_CONSECUTIVE_ERRORS = 3
-  let lastDisplayedAction = null
+  let lastDisplayedAction: string | null = null
 
   while (true) {
     switch (response.status) {
@@ -180,22 +182,22 @@ export async function runAgent({ prompt, command = null, model = null }) {
         spinner.stop()
 
         if (hasReasoning && response.reasoning) {
-          await typeReasoning(response.reasoning)
+          await typeReasoning(response.reasoning as string)
         }
 
         console.log("")
 
-        if (response.summary && response.summary.memoryUpdated) {
+        const summary = response.summary as Record<string, unknown> | null
+        if (summary && summary.memoryUpdated) {
           console.log(chalk.dim("  ───────────────────────────────────"))
           console.log(chalk.yellow.bold("  MEMORY SAVED"))
-          if (response.summary.patternSaved) {
-            console.log(chalk.white(`  Pattern: ${response.summary.patternSaved}`))
+          if (summary.patternSaved) {
+            console.log(chalk.white(`  Pattern: ${summary.patternSaved}`))
           }
           console.log(chalk.dim("  This is now shared with the whole team."))
           console.log("")
         }
 
-        // Show completed task summary
         if (taskSteps.length > 0) {
           console.log(chalk.dim("  ───────────────────────────────────"))
           console.log(chalk.white.bold(`  ${completedSteps.size}/${taskSteps.length} tasks completed`))
@@ -221,8 +223,6 @@ export async function runAgent({ prompt, command = null, model = null }) {
         return response
 
       case "failed": {
-        // If the AI gave up mid-run, give it one more shot by sending the failure
-        // back as a tool result so it can try to recover
         if (stepCount > 0 && consecutiveErrors < MAX_CONSECUTIVE_ERRORS && response.runId) {
           consecutiveErrors++
           spinner.stop()
@@ -240,46 +240,42 @@ export async function runAgent({ prompt, command = null, model = null }) {
           })
           break
         }
-        spinner.fail(chalk.red(response.error || "Agent failed"))
-        throw new Error(response.error || "Agent failed")
+        spinner.fail(chalk.red((response.error as string) || "Agent failed"))
+        throw new Error((response.error as string) || "Agent failed")
       }
 
       case "needs_tool": {
         stepCount++
 
-        // Track which task step this action will complete (marked after execution)
-        const pendingTaskStep = response.taskStep || null
+        const pendingTaskStep = (response.taskStep as string) || null
+        const args = response.args as Record<string, unknown>
 
-        // Dedup: skip display if model returned the exact same action twice
-        const actionKey = `${response.tool}:${JSON.stringify(response.args)}:${response.reasoning || ""}`
+        const actionKey = `${response.tool}:${JSON.stringify(args)}:${response.reasoning || ""}`
         const isDuplicate = actionKey === lastDisplayedAction
         lastDisplayedAction = actionKey
 
-        // Simulate LLM think time (faster without reasoning)
         await sleep(hasReasoning ? thinkTime() : 200 + Math.floor(Math.random() * 400))
 
-        if (isHiddenStep(response.tool)) {
+        if (isHiddenStep(response.tool as string)) {
           spinner.text = chalk.dim("scanning directory...")
         } else if (isDuplicate) {
-          // Model repeated itself — skip display, still execute the tool
           spinner.stop()
           spinner.start(chalk.dim("thinking..."))
         } else {
-          // Show reasoning with typing animation (only if model supports it)
           if (hasReasoning && response.reasoning) {
             spinner.stop()
-            await typeReasoning(response.reasoning)
+            await typeReasoning(response.reasoning as string)
           } else {
             spinner.stop()
           }
 
-          // Show task checklist after first reasoning
-          if (response.task && !taskShown) {
+          const task = response.task as Record<string, unknown> | null
+          if (task && !taskShown) {
             taskShown = true
-            taskSteps = response.task.steps || []
+            taskSteps = (task.steps || []) as Array<{ id: string; label: string }>
             console.log("")
-            console.log(chalk.white.bold(`  TASK: ${response.task.title}`))
-            console.log(chalk.dim(`  ${response.task.goal}`))
+            console.log(chalk.white.bold(`  TASK: ${task.title}`))
+            console.log(chalk.dim(`  ${task.goal}`))
             console.log("")
             for (const s of taskSteps) {
               console.log(chalk.dim(`  [ ] ${s.label}`))
@@ -287,26 +283,24 @@ export async function runAgent({ prompt, command = null, model = null }) {
             console.log("")
           }
 
-          // Handle batch_read specially — show grouped list
           if (response.tool === "batch_read") {
-            const paths = response.args.paths
+            const paths = (args.paths || []) as string[]
             console.log(chalk.blue("    read") + chalk.dim(` ${paths.length} files`))
             for (const p of paths) {
               console.log(chalk.dim(`      ${p}`))
             }
           } else if (response.tool === "run_command") {
-            // Show command inline with spinner
-            const cmd = response.args.command
+            const cmd = args.command as string
             spinner.start(chalk.dim("  ") + chalk.white(cmd))
           } else {
-            const label = formatToolLabel(response.tool, response.args)
+            const label = formatToolLabel(response.tool as string, args)
             const hasDiff = response.tool === "write_file" || response.tool === "edit_file"
             if (hasDiff) {
-              const newContent = response.args.content || response.args.patch || ""
-              let oldContent = null
-              try { oldContent = await readFileTool(response.args.path) } catch { /* new file */ }
+              const newContent = (args.content || args.patch || "") as string
+              let oldContent: string | null = null
+              try { oldContent = await readFileTool(args.path as string) } catch { /* new file */ }
               const { added, removed } = computeLineDiff(oldContent, newContent)
-              const parts = []
+              const parts: string[] = []
               if (added > 0) parts.push(chalk.green(`+${added}`))
               if (removed > 0) parts.push(chalk.red(`-${removed}`))
               const diffTag = parts.length > 0 ? " " + parts.join(chalk.dim(" ")) : ""
@@ -316,24 +310,21 @@ export async function runAgent({ prompt, command = null, model = null }) {
             }
           }
 
-          // Don't start thinking spinner for run_command (it already has inline spinner)
           if (response.tool !== "run_command") {
             spinner.start(chalk.dim("thinking..."))
           }
         }
 
-        const currentTool = response.tool
-        const currentCmd = response.args?.command
+        const currentTool = response.tool as string
+        const currentCmd = args?.command as string | undefined
 
         try {
-          response = await executeTool(response)
+          response = await executeTool(response as never)
           consecutiveErrors = 0
 
-          // After run_command completes, replace spinner with done indicator
           if (currentTool === "run_command") {
             spinner.stop()
-            // Check if the tool result indicates skipped/timed out
-            const toolResult = response.result || response.lastResult
+            const toolResult = (response.result || response.lastResult) as Record<string, unknown> | undefined
             if (toolResult?.skipped) {
               console.log(chalk.yellow("  ⚠ ") + chalk.dim(currentCmd) + chalk.yellow(" (user should run manually)"))
             } else if (toolResult?.timedOut) {
@@ -344,7 +335,6 @@ export async function runAgent({ prompt, command = null, model = null }) {
             spinner.start(chalk.dim("thinking..."))
           }
 
-          // Mark task step as completed after successful execution
           if (pendingTaskStep && taskSteps.length > 0) {
             const step = taskSteps.find((s) => s.id === pendingTaskStep)
             if (step) completedSteps.add(step.id)
@@ -353,9 +343,9 @@ export async function runAgent({ prompt, command = null, model = null }) {
           consecutiveErrors++
           spinner.stop()
           if (currentTool === "run_command") {
-            console.log(chalk.red("  ✖ ") + chalk.dim(currentCmd) + chalk.red(` — ${toolError.message}`))
+            console.log(chalk.red("  ✖ ") + chalk.dim(currentCmd) + chalk.red(` — ${(toolError as Error).message}`))
           } else {
-            console.log(chalk.red(`    x ${toolError.message}`))
+            console.log(chalk.red(`    x ${(toolError as Error).message}`))
           }
 
           if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
@@ -370,7 +360,7 @@ export async function runAgent({ prompt, command = null, model = null }) {
             runId: response.runId,
             tool: response.tool,
             result: {
-              error: toolError.message,
+              error: (toolError as Error).message,
               success: false
             }
           })

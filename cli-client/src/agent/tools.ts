@@ -2,15 +2,20 @@ import fs from "node:fs/promises"
 import path from "node:path"
 import { spawn } from "node:child_process"
 
-export async function listDirectoryTool(dirPath) {
+interface DirectoryEntry {
+  name: string
+  type: "file" | "directory"
+}
+
+export async function listDirectoryTool(dirPath: string): Promise<DirectoryEntry[]> {
   const entries = await fs.readdir(dirPath, { withFileTypes: true })
   return entries.map((entry) => ({
     name: entry.name,
-    type: entry.isDirectory() ? "directory" : "file"
+    type: entry.isDirectory() ? "directory" as const : "file" as const
   }))
 }
 
-export async function fileExistsTool(filePath) {
+export async function fileExistsTool(filePath: string): Promise<boolean> {
   try {
     await fs.access(filePath)
     return true
@@ -19,39 +24,39 @@ export async function fileExistsTool(filePath) {
   }
 }
 
-export async function createDirectoryTool(dirPath) {
+export async function createDirectoryTool(dirPath: string): Promise<boolean> {
   await fs.mkdir(dirPath, { recursive: true })
   return true
 }
 
-export async function readFileTool(filePath) {
+export async function readFileTool(filePath: string): Promise<string> {
   return fs.readFile(filePath, "utf8")
 }
 
-export async function writeFileTool(filePath, content) {
+export async function writeFileTool(filePath: string, content: string): Promise<boolean> {
   await fs.mkdir(path.dirname(filePath), { recursive: true })
   await fs.writeFile(filePath, content, "utf8")
   return true
 }
 
-export async function editFileTool(filePath, patch) {
+export async function editFileTool(filePath: string, patch: string): Promise<boolean> {
   await fs.mkdir(path.dirname(filePath), { recursive: true })
   await fs.writeFile(filePath, patch, "utf8")
   return true
 }
 
-export async function moveFileTool(from, to) {
+export async function moveFileTool(from: string, to: string): Promise<boolean> {
   await fs.mkdir(path.dirname(to), { recursive: true })
   await fs.rename(from, to)
   return true
 }
 
-export async function deleteFileTool(filePath) {
+export async function deleteFileTool(filePath: string): Promise<boolean> {
   await fs.unlink(filePath)
   return true
 }
 
-export async function searchCodeTool(directory, pattern) {
+export async function searchCodeTool(directory: string, pattern: string): Promise<string[]> {
   return new Promise((resolve) => {
     const isWindows = process.platform === "win32"
     const shell = isWindows ? "cmd.exe" : "/bin/sh"
@@ -62,7 +67,7 @@ export async function searchCodeTool(directory, pattern) {
 
     const child = spawn(shell, shellArgs, { cwd: directory })
     let stdout = ""
-    child.stdout.on("data", (d) => { stdout += d.toString() })
+    child.stdout.on("data", (d: Buffer) => { stdout += d.toString() })
     child.on("close", () => {
       resolve(stdout.trim().split("\n").filter(Boolean))
     })
@@ -70,7 +75,6 @@ export async function searchCodeTool(directory, pattern) {
   })
 }
 
-// Commands that start long-running processes (servers, watchers, etc.)
 const LONG_RUNNING_PATTERNS = [
   /^npm\s+start/,
   /^npm\s+run\s+(dev|start|serve|watch)/,
@@ -81,9 +85,17 @@ const LONG_RUNNING_PATTERNS = [
   /^bun\s+run/
 ]
 
-const COMMAND_TIMEOUT_MS = 30_000 // 30s for normal commands
+const COMMAND_TIMEOUT_MS = 30_000
 
-export async function runCommandTool(command, cwd = process.cwd()) {
+interface CommandResult {
+  stdout: string
+  stderr: string
+  skipped?: boolean
+  timedOut?: boolean
+  message?: string
+}
+
+export async function runCommandTool(command: string, cwd: string = process.cwd()): Promise<CommandResult> {
   const isLongRunning = LONG_RUNNING_PATTERNS.some((p) => p.test(command.trim()))
 
   if (isLongRunning) {
@@ -105,8 +117,8 @@ export async function runCommandTool(command, cwd = process.cwd()) {
     let stdout = ""
     let stderr = ""
 
-    child.stdout.on("data", (d) => { stdout += d.toString() })
-    child.stderr.on("data", (d) => { stderr += d.toString() })
+    child.stdout.on("data", (d: Buffer) => { stdout += d.toString() })
+    child.stderr.on("data", (d: Buffer) => { stderr += d.toString() })
 
     const timer = setTimeout(() => {
       child.kill("SIGTERM")
@@ -114,7 +126,7 @@ export async function runCommandTool(command, cwd = process.cwd()) {
         stdout: stdout.slice(-2000),
         stderr: stderr.slice(-2000),
         timedOut: true,
-        message: `Command timed out after ${COMMAND_TIMEOUT_MS / 1000}s. Partial output included. If this is a server/watcher, tell the user to run it manually.`
+        message: `Command timed out after ${COMMAND_TIMEOUT_MS / 1000}s. Partial output included.`
       })
     }, COMMAND_TIMEOUT_MS)
 
@@ -134,7 +146,7 @@ export async function runCommandTool(command, cwd = process.cwd()) {
   })
 }
 
-export function computeLineDiff(oldContent, newContent) {
+export function computeLineDiff(oldContent: string | null, newContent: string): { added: number; removed: number } {
   const oldLines = oldContent ? oldContent.split("\n") : []
   const newLines = newContent ? newContent.split("\n") : []
   const oldSet = new Set(oldLines)
@@ -150,8 +162,8 @@ export function computeLineDiff(oldContent, newContent) {
   return { added, removed }
 }
 
-export async function scanDirectoryTree(dirPath, prefix = "") {
-  const tree = []
+export async function scanDirectoryTree(dirPath: string, prefix: string = ""): Promise<DirectoryEntry[]> {
+  const tree: DirectoryEntry[] = []
   try {
     const entries = await fs.readdir(dirPath, { withFileTypes: true })
     const sorted = entries
