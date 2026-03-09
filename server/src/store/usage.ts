@@ -1,8 +1,28 @@
 import { recordUsage, calculateCostCents } from "./subscriptions.js"
+import type { TokenUsage } from "../types.js"
 
-const usageRecords = []
+interface UsageRecord {
+  runId: string
+  projectId: string
+  model: string
+  inputTokens: number
+  outputTokens: number
+  costCents: number
+  timestamp: string
+}
 
-export async function persistModelUsage({ runId, projectId, model, usage, userId, isNewPrompt }) {
+interface PersistUsageParams {
+  runId: string
+  projectId: string
+  model: string
+  usage: TokenUsage | null | undefined
+  userId?: string | null
+  isNewPrompt?: boolean
+}
+
+const usageRecords: UsageRecord[] = []
+
+export async function persistModelUsage({ runId, projectId, model, usage, userId, isNewPrompt }: PersistUsageParams): Promise<void> {
   if (!usage) return
 
   const inputTokens = usage.inputTokens || 0
@@ -19,12 +39,11 @@ export async function persistModelUsage({ runId, projectId, model, usage, userId
     timestamp: new Date().toISOString()
   })
 
-  // Record in DB + deduct credits/increment free counter
   if (userId) {
     await recordUsage(userId, { runId, projectId, model, inputTokens, outputTokens, costCents, isNewPrompt: !!isNewPrompt })
   }
 }
 
-export function getUsageRecords() {
+export function getUsageRecords(): UsageRecord[] {
   return usageRecords
 }

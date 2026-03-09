@@ -1,57 +1,73 @@
-/**
- * Session store — PostgreSQL-backed history of runs per project.
- *
- * Persists across server restarts so the AI remembers previous sessions.
- * Actions are recorded per-run in the run_actions table.
- * Completed/failed runs are saved to the sessions table as summaries.
- */
-
 import { query } from "../db/connection.js"
 
 const MAX_SESSIONS_IN_PROMPT = 20
 
-// ─── In-memory action buffer (flushed to DB when run ends) ───
+interface RunActionLog {
+  actions: Array<Record<string, unknown>>
+  filesModified: string[]
+  errors: Array<{ tool: string; error: string; actionIndex: number }>
+  projectId: string
+}
 
-const runActions = new Map()
+interface SessionEntry {
+  runId: string
+  prompt: string
+  model: string
+  outcome?: string
+  error?: string | null
+  filesModified?: string[]
+  userId?: string | null
+  chatId?: string | null
+}
 
-export function recordRunAction(runId, tool, args, projectId) {
+interface SessionRecord {
+  runId: string
+  prompt: string
+  model: string
+  outcome: string
+  error: string | null
+  filesModified: string[]
+  actions: Array<{ tool: string; path?: string; command?: string; output?: string; skipped?: boolean }>
+  timestamp: string
+}
+
+const runActions = new Map<string, RunActionLog>()
+
+export function recordRunAction(runId: string, tool: string, args: Record<string, unknown>, projectId: string): void {
   if (!runActions.has(runId)) {
     runActions.set(runId, { actions: [], filesModified: [], errors: [], projectId })
   }
 
-  const log = runActions.get(runId)
+  const log = runActions.get(runId)!
 
-  const action = { tool }
+  const action: Record<string, unknown> = { tool }
   if (args?.path) action.path = args.path
-  if (args?.command) action.command = args.command?.slice(0, 120)
+  if (args?.command) action.command = (args.command as string)?.slice(0, 120)
   if (args?.from) action.from = args.from
   if (args?.to) action.to = args.to
-  // Store command output/result summary for richer session history
   if (tool === "run_command") {
-    if (args?.stdout) action.output = args.stdout.slice(-500)
-    if (args?.stderr) action.stderr = args.stderr.slice(-300)
+    if (args?.stdout) action.output = (args.stdout as string).slice(-500)
+    if (args?.stderr) action.stderr = (args.stderr as string).slice(-300)
     if (args?.skipped) action.skipped = true
-    if (args?.message) action.message = args.message.slice(0, 200)
+    if (args?.message) action.message = (args.message as string).slice(0, 200)
   }
   if (tool === "read_file" && args?.content) {
-    action.contentPreview = args.content.slice(0, 200)
+    action.contentPreview = (args.content as string).slice(0, 200)
   }
   log.actions.push(action)
 
   if ((tool === "write_file" || tool === "edit_file") && args?.path) {
-    if (!log.filesModified.includes(args.path)) {
-      log.filesModified.push(args.path)
+    if (!log.filesModified.includes(args.path as string)) {
+      log.filesModified.push(args.path as string)
     }
   }
 
-  // Track errors from tool results for error→fix pattern detection
   const result = args
   if (result?.error || result?.stderr || result?.success === false) {
     const errMsg = result.error || result.stderr || "Tool returned failure"
     log.errors.push({ tool, error: typeof errMsg === "string" ? errMsg.slice(0, 300) : String(errMsg).slice(0, 300), actionIndex: log.actions.length - 1 })
   }
 
-  // Also write to DB immediately so nothing is lost on crash
   query(
     `INSERT INTO run_actions (run_id, project_id, tool, path, command, extra)
      VALUES ($1, $2, $3, $4, $5, $6)`,
@@ -59,24 +75,22 @@ export function recordRunAction(runId, tool, args, projectId) {
       runId,
       projectId || log.projectId,
       tool,
-      action.path || null,
-      action.command || null,
+      (action.path as string) || null,
+      (action.command as string) || null,
       JSON.stringify(action)
     ]
-  ).catch((err) => console.error("[sessions] Failed to save run action:", err.message))
+  ).catch((err) => console.error("[sessions] Failed to save run action:", (err as Error).message))
 }
 
-export function getRunActions(runId) {
-  return runActions.get(runId) || { actions: [], filesModified: [] }
+export function getRunActions(runId: string): RunActionLog {
+  return runActions.get(runId) || { actions: [], filesModified: [], errors: [], projectId: "" }
 }
 
-export function clearRunActions(runId) {
+export function clearRunActions(runId: string): void {
   runActions.delete(runId)
 }
 
-// ─── Session persistence (DB) ───
-
-export async function saveSessionEntry(projectId, entry) {
+export async function saveSessionEntry(projectId: string, entry: SessionEntry): Promise<void> {
   await query(
     `INSERT INTO sessions (run_id, project_id, prompt, model, outcome, error, files_modified, user_id, chat_id)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
@@ -94,10 +108,9 @@ export async function saveSessionEntry(projectId, entry) {
   )
 }
 
-export async function getRecentSessions(projectId, chatId, limit) {
+export async function getRecentSessions(projectId: string, chatId?: string | null, limit?: number): Promise<SessionRecord[]> {
   const count = limit || MAX_SESSIONS_IN_PROMPT
 
-  // If chatId is provided, scope to that chat. Otherwise, project-wide.
   let res
   if (chatId) {
     res = await query(
@@ -119,8 +132,7 @@ export async function getRecentSessions(projectId, chatId, limit) {
     )
   }
 
-  // Also load each session's actions
-  const sessions = []
+  const sessions: SessionRecord[] = []
   for (const row of res.rows.reverse()) {
     const actionsRes = await query(
       `SELECT tool, path, command FROM run_actions WHERE run_id = $1 ORDER BY created_at`,
@@ -134,7 +146,7 @@ export async function getRecentSessions(projectId, chatId, limit) {
       outcome: row.outcome,
       error: row.error,
       filesModified: row.files_modified || [],
-      actions: actionsRes.rows.map((a) => ({ tool: a.tool, path: a.path, command: a.command })),
+      actions: actionsRes.rows.map((a: Record<string, unknown>) => ({ tool: a.tool as string, path: a.path as string | undefined, command: a.command as string | undefined })),
       timestamp: row.created_at
     })
   }
@@ -142,57 +154,35 @@ export async function getRecentSessions(projectId, chatId, limit) {
   return sessions
 }
 
-export async function getLastSession(projectId, chatId) {
+export async function getLastSession(projectId: string, chatId?: string | null): Promise<SessionRecord | null> {
   const sessions = await getRecentSessions(projectId, chatId, 1)
   return sessions.length > 0 ? sessions[0] : null
 }
 
-/**
- * Find runs that have recorded actions but no session entry (interrupted/orphaned runs).
- * Creates "interrupted" session entries so the AI remembers what happened.
- */
-export async function saveOrphanedSessions(projectId, chatId) {
+export async function saveOrphanedSessions(projectId: string, chatId?: string | null): Promise<void> {
   try {
-    // Find distinct run_ids in run_actions for this project that have no matching session
-    let res
-    if (chatId) {
-      // For chat-scoped: find orphaned runs that belong to this project
-      // (run_actions don't store chat_id, so we match by project and exclude known sessions)
-      res = await query(
-        `SELECT DISTINCT ra.run_id, MIN(ra.created_at) as first_action
-         FROM run_actions ra
-         WHERE ra.project_id = $1
-           AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.run_id = ra.run_id)
-         GROUP BY ra.run_id
-         ORDER BY first_action`,
-        [projectId]
-      )
-    } else {
-      res = await query(
-        `SELECT DISTINCT ra.run_id, MIN(ra.created_at) as first_action
-         FROM run_actions ra
-         WHERE ra.project_id = $1
-           AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.run_id = ra.run_id)
-         GROUP BY ra.run_id
-         ORDER BY first_action`,
-        [projectId]
-      )
-    }
+    const res = await query(
+      `SELECT DISTINCT ra.run_id, MIN(ra.created_at) as first_action
+       FROM run_actions ra
+       WHERE ra.project_id = $1
+         AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.run_id = ra.run_id)
+       GROUP BY ra.run_id
+       ORDER BY first_action`,
+      [projectId]
+    )
 
     for (const row of res.rows) {
-      // Load actions for this orphaned run
       const actionsRes = await query(
         `SELECT tool, path, command FROM run_actions WHERE run_id = $1 ORDER BY created_at`,
         [row.run_id]
       )
 
-      const actions = actionsRes.rows
+      const actions = actionsRes.rows as Array<{ tool: string; path?: string }>
       const filesModified = actions
         .filter((a) => a.tool === "write_file" || a.tool === "edit_file")
         .map((a) => a.path)
-        .filter(Boolean)
+        .filter(Boolean) as string[]
 
-      // Build a prompt summary from the actions (we don't have the original prompt)
       const actionSummary = actions.map((a) => a.tool + (a.path ? ` ${a.path}` : "")).join(", ")
 
       await saveSessionEntry(projectId, {
@@ -209,15 +199,11 @@ export async function saveOrphanedSessions(projectId, chatId) {
       console.log(`[sessions] Saved orphaned run ${row.run_id} as interrupted session`)
     }
   } catch (err) {
-    console.error("[sessions] Failed to save orphaned sessions:", err.message)
+    console.error("[sessions] Failed to save orphaned sessions:", (err as Error).message)
   }
 }
 
-/**
- * Build a compact text summary of recent sessions for injection into the AI prompt.
- * Returns null if there are no previous sessions.
- */
-export async function buildSessionSummary(projectId, chatId) {
+export async function buildSessionSummary(projectId: string, chatId?: string | null): Promise<string | null> {
   const recent = await getRecentSessions(projectId, chatId)
   if (recent.length === 0) return null
 
@@ -255,20 +241,15 @@ export async function buildSessionSummary(projectId, chatId) {
   return lines.join("\n")
 }
 
-/**
- * Build a detailed context for the /continue command.
- * Includes all sessions in the chat with full action details and file lists.
- */
-export async function buildContinueContext(projectId, chatId) {
+export async function buildContinueContext(projectId: string, chatId?: string | null): Promise<string | null> {
   const recent = await getRecentSessions(projectId, chatId, 10)
   if (recent.length === 0) return null
 
-  const allFilesCreated = new Set()
-  const allFilesModified = new Set()
-  let lastError = null
-  let lastPrompt = null
+  const allFilesCreated = new Set<string>()
+  const allFilesModified = new Set<string>()
+  let lastError: string | null = null
 
-  const lines = []
+  const lines: string[] = []
   lines.push("=== CONTINUATION CONTEXT — Full history of this chat ===")
 
   for (const session of recent) {
@@ -280,10 +261,10 @@ export async function buildContinueContext(projectId, chatId) {
       for (const a of session.actions) {
         if (a.tool === "write_file") {
           lines.push(`    - Created file: ${a.path}`)
-          allFilesCreated.add(a.path)
+          if (a.path) allFilesCreated.add(a.path)
         } else if (a.tool === "edit_file") {
           lines.push(`    - Edited file: ${a.path}`)
-          allFilesModified.add(a.path)
+          if (a.path) allFilesModified.add(a.path)
         } else if (a.tool === "read_file") {
           lines.push(`    - Read file: ${a.path}`)
         } else if (a.tool === "run_command") {
@@ -306,11 +287,8 @@ export async function buildContinueContext(projectId, chatId) {
       lines.push(`  Error: ${session.error.slice(0, 300)}`)
       lastError = session.error
     }
-
-    lastPrompt = session.prompt
   }
 
-  // Summary at the end
   lines.push("\n=== SUMMARY ===")
   if (allFilesCreated.size > 0) lines.push(`Files already created: ${[...allFilesCreated].join(", ")}`)
   if (allFilesModified.size > 0) lines.push(`Files already modified: ${[...allFilesModified].join(", ")}`)

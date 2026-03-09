@@ -1,22 +1,30 @@
-/**
- * Context store — PostgreSQL-backed project context/patterns/memories.
- *
- * The AI writes patterns, fixes, and learnings here after each task.
- * Before implementing, the AI reads only RELEVANT context (filtered by tags/category).
- *
- * Categories:
- *   - "pattern"   — coding patterns, architectural decisions
- *   - "fix"       — bug fixes, gotchas, things that went wrong
- *   - "memory"    — general project knowledge, setup notes
- *   - "preference"— user preferences, coding style
- */
-
 import { query } from "../db/connection.js"
 
-/**
- * Save a context entry for a project.
- */
-export async function saveContext({ projectId, userId, category, title, content, tags }) {
+interface SaveContextParams {
+  projectId: string
+  userId?: string | null
+  category?: string
+  title: string
+  content: string
+  tags?: string[]
+}
+
+interface ContextEntry {
+  id: number
+  category: string
+  title: string
+  content: string
+  tags: string[]
+  created_at: string
+}
+
+interface QueryContextOpts {
+  category?: string
+  tags?: string[]
+  limit?: number
+}
+
+export async function saveContext({ projectId, userId, category, title, content, tags }: SaveContextParams): Promise<{ id: number; title: string; category: string }> {
   const res = await query(
     `INSERT INTO context_entries (project_id, user_id, category, title, content, tags)
      VALUES ($1, $2, $3, $4, $5, $6)
@@ -26,22 +34,12 @@ export async function saveContext({ projectId, userId, category, title, content,
   return res.rows[0]
 }
 
-/**
- * Query relevant context entries for a project.
- * Filters by category and/or tags to avoid loading unrelated stuff.
- *
- * @param {string} projectId
- * @param {object} opts - { category, tags, limit }
- *   - category: filter by category (e.g. "pattern", "fix")
- *   - tags: array of tags to match (ANY match)
- *   - limit: max entries to return (default 10)
- */
-export async function queryContext(projectId, opts = {}) {
+export async function queryContext(projectId: string, opts: QueryContextOpts = {}): Promise<ContextEntry[]> {
   const { category, tags, limit = 10 } = opts
 
   let sql = `SELECT id, category, title, content, tags, created_at
              FROM context_entries WHERE project_id = $1`
-  const params = [projectId]
+  const params: unknown[] = [projectId]
   let paramIdx = 2
 
   if (category) {
@@ -63,10 +61,7 @@ export async function queryContext(projectId, opts = {}) {
   return res.rows
 }
 
-/**
- * Get ALL context for a project (used for full dump — limited to recent 20).
- */
-export async function getAllContext(projectId) {
+export async function getAllContext(projectId: string): Promise<ContextEntry[]> {
   const res = await query(
     `SELECT id, category, title, content, tags, created_at
      FROM context_entries WHERE project_id = $1
@@ -76,31 +71,20 @@ export async function getAllContext(projectId) {
   return res.rows
 }
 
-/**
- * Build a compact context summary for injection into the AI prompt.
- * Only loads relevant context based on keywords from the user's prompt.
- *
- * @param {string} projectId
- * @param {string} userPrompt - the user's current prompt (for keyword extraction)
- */
-export async function buildContextForPrompt(projectId, userPrompt) {
-  // Extract simple keywords from the prompt for tag matching
+export async function buildContextForPrompt(projectId: string, userPrompt: string): Promise<string | null> {
   const keywords = extractKeywords(userPrompt)
 
-  // Always load patterns and preferences (they're broadly useful)
   const patterns = await queryContext(projectId, { category: "pattern", limit: 5 })
   const preferences = await queryContext(projectId, { category: "preference", limit: 3 })
 
-  // Load fixes and memories only if keywords match
-  let fixes = []
-  let memories = []
+  let fixes: ContextEntry[] = []
+  let memories: ContextEntry[] = []
 
   if (keywords.length > 0) {
     fixes = await queryContext(projectId, { category: "fix", tags: keywords, limit: 5 })
     memories = await queryContext(projectId, { category: "memory", tags: keywords, limit: 5 })
   }
 
-  // If no keyword-matched fixes/memories, load the most recent ones
   if (fixes.length === 0) {
     fixes = await queryContext(projectId, { category: "fix", limit: 3 })
   }
@@ -111,8 +95,7 @@ export async function buildContextForPrompt(projectId, userPrompt) {
   const all = [...patterns, ...preferences, ...fixes, ...memories]
   if (all.length === 0) return null
 
-  // Deduplicate by id
-  const seen = new Set()
+  const seen = new Set<number>()
   const unique = all.filter((e) => {
     if (seen.has(e.id)) return false
     seen.add(e.id)
@@ -127,11 +110,7 @@ export async function buildContextForPrompt(projectId, userPrompt) {
   return lines.join("\n")
 }
 
-/**
- * Extract simple keywords from a prompt for tag matching.
- * Returns lowercase words that are likely meaningful.
- */
-function extractKeywords(prompt) {
+function extractKeywords(prompt: string): string[] {
   if (!prompt) return []
 
   const stopWords = new Set([
