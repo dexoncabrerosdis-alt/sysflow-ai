@@ -1,9 +1,17 @@
 import pg from "pg"
 const { Pool, Client } = pg
 
-let pool = null
+let pool: pg.Pool | null = null
 
-function getDbConfig() {
+interface DbConfig {
+  host: string
+  port: number
+  user: string
+  password: string
+  database: string
+}
+
+function getDbConfig(): DbConfig {
   return {
     host: process.env.DB_HOST || "localhost",
     port: parseInt(process.env.DB_PORT || "5432", 10),
@@ -13,11 +21,7 @@ function getDbConfig() {
   }
 }
 
-/**
- * Automatically creates the "sysflow" database if it doesn't exist.
- * Connects to the default "postgres" database first to check/create.
- */
-async function ensureDatabase() {
+async function ensureDatabase(): Promise<void> {
   const config = getDbConfig()
   const client = new Client({
     host: config.host,
@@ -46,45 +50,29 @@ async function ensureDatabase() {
   }
 }
 
-/**
- * Returns the shared connection pool.
- */
-export function getPool() {
+export function getPool(): pg.Pool {
   if (!pool) {
     pool = new Pool(getDbConfig())
   }
   return pool
 }
 
-/**
- * Run a single query using the shared pool.
- */
-export async function query(text, params) {
+export async function query(text: string, params?: unknown[]): Promise<pg.QueryResult> {
   return getPool().query(text, params)
 }
 
-/**
- * Initialize the database: create if needed, then run migrations.
- */
-export async function initDatabase() {
+export async function initDatabase(): Promise<void> {
   await ensureDatabase()
 
   const p = getPool()
 
-  // Test the connection
   const res = await p.query("SELECT NOW()")
   console.log(`[db] Connected to PostgreSQL at ${res.rows[0].now}`)
 
-  // Run migrations
   await runMigrations(p)
 }
 
-/**
- * Simple built-in migration runner.
- * Tracks which migrations have run in a `_migrations` table.
- */
-async function runMigrations(pool) {
-  // Create migrations tracking table if not exists
+async function runMigrations(pool: pg.Pool): Promise<void> {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS _migrations (
       id SERIAL PRIMARY KEY,
@@ -93,7 +81,6 @@ async function runMigrations(pool) {
     )
   `)
 
-  // Import migrations in order
   const migrations = await getMigrations()
 
   for (const migration of migrations) {
@@ -116,10 +103,7 @@ async function runMigrations(pool) {
   console.log("[db] All migrations up to date.")
 }
 
-/**
- * Load all migration files in order.
- */
-async function getMigrations() {
+async function getMigrations(): Promise<Array<{ name: string; up: string }>> {
   const mods = [
     await import("./migrations/001_create_sessions.js"),
     await import("./migrations/002_create_run_actions.js"),
@@ -134,7 +118,7 @@ async function getMigrations() {
   return mods.map((m) => m.default)
 }
 
-export async function closeDatabase() {
+export async function closeDatabase(): Promise<void> {
   if (pool) {
     await pool.end()
     pool = null
