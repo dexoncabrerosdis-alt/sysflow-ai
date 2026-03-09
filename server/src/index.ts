@@ -15,18 +15,17 @@ const fastify = Fastify({
 
 // Preserve raw body for Stripe webhook signature verification
 fastify.addContentTypeParser("application/json", { parseAs: "string" }, (req, body, done) => {
-  req.rawBody = body
+  (req as unknown as { rawBody: unknown }).rawBody = body
   try {
-    done(null, JSON.parse(body))
+    done(null, JSON.parse(body as string))
   } catch (err) {
-    done(err, undefined)
+    done(err as Error, undefined)
   }
 })
 
 await fastify.register(cors, {
   origin: true
 })
-
 
 await fastify.register(authRoutes)
 await fastify.register(chatRoutes)
@@ -37,16 +36,13 @@ fastify.get("/health", async () => {
   return { status: "ok", timestamp: new Date().toISOString() }
 })
 
-// Graceful shutdown
 fastify.addHook("onClose", async () => {
   await closeDatabase()
 })
 
-async function start() {
+async function start(): Promise<void> {
   try {
-    // Initialize DB: auto-create database + run migrations
     await initDatabase()
-
     await fastify.listen({ port: 3000, host: "0.0.0.0" })
     console.log("Sysflow API listening on http://localhost:3000")
   } catch (error) {

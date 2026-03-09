@@ -1,13 +1,13 @@
 import { query } from "../db/connection.js"
 import { extractUser } from "./auth.js"
+import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify"
 
-export async function chatRoutes(fastify) {
-  // ─── List chats for current user + project ───
-  fastify.get("/chats", async (request, reply) => {
+export async function chatRoutes(fastify: FastifyInstance): Promise<void> {
+  fastify.get("/chats", async (request: FastifyRequest, reply: FastifyReply) => {
     const user = extractUser(request)
     if (!user) return reply.code(401).send({ error: "Not authenticated" })
 
-    const projectId = request.query.projectId || null
+    const projectId = (request.query as Record<string, string>).projectId || null
 
     let res
     if (projectId) {
@@ -35,12 +35,11 @@ export async function chatRoutes(fastify) {
     return { status: "ok", chats: res.rows }
   })
 
-  // ─── Create a new chat ───
-  fastify.post("/chats", async (request, reply) => {
+  fastify.post("/chats", async (request: FastifyRequest, reply: FastifyReply) => {
     const user = extractUser(request)
     if (!user) return reply.code(401).send({ error: "Not authenticated" })
 
-    const { projectId, title, model } = request.body || {}
+    const { projectId, title, model } = (request.body || {}) as { projectId?: string; title?: string; model?: string }
     if (!projectId) return reply.code(400).send({ error: "projectId is required" })
 
     const res = await query(
@@ -53,12 +52,11 @@ export async function chatRoutes(fastify) {
     return { status: "ok", chat: res.rows[0] }
   })
 
-  // ─── Get a single chat with its session history ───
-  fastify.get("/chats/:chatUid", async (request, reply) => {
+  fastify.get("/chats/:chatUid", async (request: FastifyRequest, reply: FastifyReply) => {
     const user = extractUser(request)
     if (!user) return reply.code(401).send({ error: "Not authenticated" })
 
-    const { chatUid } = request.params
+    const { chatUid } = request.params as { chatUid: string }
 
     const chatRes = await query(
       `SELECT id, chat_uid, title, model, status, project_id, created_at, updated_at
@@ -72,7 +70,6 @@ export async function chatRoutes(fastify) {
 
     const chat = chatRes.rows[0]
 
-    // Load session history for this chat
     const sessionsRes = await query(
       `SELECT s.run_id, s.prompt, s.model, s.outcome, s.error, s.files_modified, s.created_at
        FROM sessions s WHERE s.chat_id = $1
@@ -95,13 +92,12 @@ export async function chatRoutes(fastify) {
     }
   })
 
-  // ─── Update chat title ───
-  fastify.patch("/chats/:chatUid", async (request, reply) => {
+  fastify.patch("/chats/:chatUid", async (request: FastifyRequest, reply: FastifyReply) => {
     const user = extractUser(request)
     if (!user) return reply.code(401).send({ error: "Not authenticated" })
 
-    const { chatUid } = request.params
-    const { title } = request.body || {}
+    const { chatUid } = request.params as { chatUid: string }
+    const { title } = (request.body || {}) as { title?: string }
 
     if (!title) return reply.code(400).send({ error: "title is required" })
 
@@ -116,14 +112,12 @@ export async function chatRoutes(fastify) {
     return { status: "ok", chat: res.rows[0] }
   })
 
-  // ─── Delete chat ───
-  fastify.delete("/chats/:chatUid", async (request, reply) => {
+  fastify.delete("/chats/:chatUid", async (request: FastifyRequest, reply: FastifyReply) => {
     const user = extractUser(request)
     if (!user) return reply.code(401).send({ error: "Not authenticated" })
 
-    const { chatUid } = request.params
+    const { chatUid } = request.params as { chatUid: string }
 
-    // Get chat id first
     const chatRes = await query(
       "SELECT id FROM chats WHERE chat_uid = $1 AND user_id = $2",
       [chatUid, user.userId]
@@ -133,7 +127,6 @@ export async function chatRoutes(fastify) {
 
     const chatId = chatRes.rows[0].id
 
-    // Delete related sessions and run_actions, then the chat
     await query("DELETE FROM run_actions WHERE run_id IN (SELECT run_id FROM sessions WHERE chat_id = $1)", [chatId])
     await query("DELETE FROM sessions WHERE chat_id = $1", [chatId])
     await query("DELETE FROM chats WHERE id = $1", [chatId])
@@ -142,11 +135,7 @@ export async function chatRoutes(fastify) {
   })
 }
 
-/**
- * Resolve a chat_uid to its internal DB id.
- * Returns { id, chatUid, userId, projectId } or null.
- */
-export async function resolveChat(chatUid, userId) {
+export async function resolveChat(chatUid: string, userId: string): Promise<{ id: number; chatUid: string; userId: string; projectId: string } | null> {
   if (!chatUid) return null
 
   const res = await query(

@@ -1,14 +1,14 @@
 import bcrypt from "bcrypt"
 import jwt from "jsonwebtoken"
 import { query } from "../db/connection.js"
+import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify"
 
 const JWT_SECRET = process.env.JWT_SECRET || "sysflow-secret-change-me"
 const SALT_ROUNDS = 10
 
-export async function authRoutes(fastify) {
-  // ─── Register ───
-  fastify.post("/auth/register", async (request, reply) => {
-    const { username, password } = request.body || {}
+export async function authRoutes(fastify: FastifyInstance): Promise<void> {
+  fastify.post("/auth/register", async (request: FastifyRequest, reply: FastifyReply) => {
+    const { username, password } = (request.body || {}) as { username?: string; password?: string }
 
     if (!username || !password) {
       return reply.code(400).send({ error: "Username and password are required" })
@@ -22,9 +22,8 @@ export async function authRoutes(fastify) {
       return reply.code(400).send({ error: "Password must be at least 4 characters" })
     }
 
-    // Check if username already exists
     const existing = await query("SELECT id FROM users WHERE username = $1", [username])
-    if (existing.rowCount > 0) {
+    if (existing.rowCount! > 0) {
       return reply.code(409).send({ error: "Username already taken" })
     }
 
@@ -44,9 +43,8 @@ export async function authRoutes(fastify) {
     }
   })
 
-  // ─── Login ───
-  fastify.post("/auth/login", async (request, reply) => {
-    const { username, password } = request.body || {}
+  fastify.post("/auth/login", async (request: FastifyRequest, reply: FastifyReply) => {
+    const { username, password } = (request.body || {}) as { username?: string; password?: string }
 
     if (!username || !password) {
       return reply.code(400).send({ error: "Username and password are required" })
@@ -72,15 +70,14 @@ export async function authRoutes(fastify) {
     }
   })
 
-  // ─── Whoami (verify token) ───
-  fastify.get("/auth/me", async (request, reply) => {
+  fastify.get("/auth/me", async (request: FastifyRequest, reply: FastifyReply) => {
     const auth = request.headers.authorization
     if (!auth || !auth.startsWith("Bearer ")) {
       return reply.code(401).send({ error: "Not authenticated" })
     }
 
     try {
-      const decoded = jwt.verify(auth.slice(7), JWT_SECRET)
+      const decoded = jwt.verify(auth.slice(7), JWT_SECRET) as { userId: string; username: string }
       return { status: "ok", user: { id: decoded.userId, username: decoded.username } }
     } catch {
       return reply.code(401).send({ error: "Invalid or expired token" })
@@ -88,17 +85,12 @@ export async function authRoutes(fastify) {
   })
 }
 
-/**
- * Auth middleware — extracts user from JWT and attaches to request.
- * Use this as a preHandler on routes that need auth.
- * Falls through gracefully if no token (for backward compatibility).
- */
-export function extractUser(request) {
+export function extractUser(request: FastifyRequest): { userId: string; username: string } | null {
   const auth = request.headers?.authorization
   if (!auth || !auth.startsWith("Bearer ")) return null
 
   try {
-    const decoded = jwt.verify(auth.slice(7), JWT_SECRET)
+    const decoded = jwt.verify(auth.slice(7), JWT_SECRET) as { userId: string; username: string }
     return { userId: decoded.userId, username: decoded.username }
   } catch {
     return null

@@ -3,24 +3,22 @@ import { query } from "../db/connection.js"
 import { extractUser } from "./auth.js"
 import { getSubscription, updateSubscriptionFromStripe, getUsageSummary, PLANS } from "../store/subscriptions.js"
 import { onCheckoutComplete, removeCheckoutListener, emitCheckoutComplete } from "../store/checkout-events.js"
+import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify"
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY)
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "")
 
-// Safely parse Stripe unix timestamps into Date objects
-function stripeDate(ts) {
+function stripeDate(ts: number | null | undefined): Date {
   if (!ts || typeof ts !== "number") return new Date()
   return new Date(ts * 1000)
 }
 
-// Map Stripe price IDs to plan names
-const PRICE_TO_PLAN = {
-  [process.env.STRIPE_PRICE_ID_LITE]: "lite",
-  [process.env.STRIPE_PRICE_ID_PRO]:  "pro",
-  [process.env.STRIPE_PRICE_ID_TEAM]: "team"
+const PRICE_TO_PLAN: Record<string, string> = {
+  [process.env.STRIPE_PRICE_ID_LITE || ""]: "lite",
+  [process.env.STRIPE_PRICE_ID_PRO || ""]: "pro",
+  [process.env.STRIPE_PRICE_ID_TEAM || ""]: "team"
 }
 
-export async function stripeRoutes(fastify) {
-  // ─── Get plans ───
+export async function stripeRoutes(fastify: FastifyInstance): Promise<void> {
   fastify.get("/billing/plans", async () => {
     return {
       plans: [
@@ -32,39 +30,36 @@ export async function stripeRoutes(fastify) {
     }
   })
 
-  // ─── Get current usage / subscription status ───
-  // Also reconciles Stripe subscriptions for users who paid but sub wasn't synced
-  fastify.get("/billing/usage", async (request, reply) => {
+  fastify.get("/billing/usage", async (request: FastifyRequest, reply: FastifyReply) => {
     const user = extractUser(request)
     if (!user) return reply.code(401).send({ error: "Not authenticated" })
 
-    // Safety net: if user has a Stripe customer but is still on free, check for active subs
     const sub = await getSubscription(user.userId)
     if (sub.plan === "free" && sub.stripe_customer_id) {
       try {
         const subs = await stripe.subscriptions.list({
-          customer: sub.stripe_customer_id,
+          customer: sub.stripe_customer_id as string,
           status: "active",
           limit: 1
         })
         if (subs.data.length > 0) {
           const activeSub = subs.data[0]
           const priceId = activeSub.items?.data?.[0]?.price?.id
-          const plan = PRICE_TO_PLAN[priceId]
+          const plan = priceId ? PRICE_TO_PLAN[priceId] : undefined
           if (plan) {
             await updateSubscriptionFromStripe(user.userId, {
               plan,
-              stripeCustomerId: sub.stripe_customer_id,
+              stripeCustomerId: sub.stripe_customer_id as string,
               stripeSubscriptionId: activeSub.id,
-              periodStart: stripeDate(activeSub.current_period_start),
-              periodEnd: stripeDate(activeSub.current_period_end),
+              periodStart: stripeDate(activeSub.current_period_start as number).toISOString(),
+              periodEnd: stripeDate(activeSub.current_period_end as number).toISOString(),
               status: "active"
             })
             console.log(`[stripe] Reconciled: activated ${plan} for user ${user.userId}`)
           }
         }
       } catch (err) {
-        console.error("[stripe] Reconciliation check failed:", err.message)
+        console.error("[stripe] Reconciliation check failed:", (err as Error).message)
       }
     }
 
@@ -72,20 +67,18 @@ export async function stripeRoutes(fastify) {
     return { status: "ok", ...summary }
   })
 
-  // ─── Create Stripe checkout session ───
-  fastify.post("/billing/checkout", async (request, reply) => {
+  fastify.post("/billing/checkout", async (request: FastifyRequest, reply: FastifyReply) => {
     const user = extractUser(request)
     if (!user) return reply.code(401).send({ error: "Not authenticated" })
 
-    const { priceId } = request.body || {}
+    const { priceId } = (request.body || {}) as { priceId?: string }
     if (!priceId) return reply.code(400).send({ error: "priceId is required" })
 
     const plan = PRICE_TO_PLAN[priceId]
     if (!plan) return reply.code(400).send({ error: "Invalid price ID" })
 
-    // Get or create Stripe customer
     const sub = await getSubscription(user.userId)
-    let customerId = sub.stripe_customer_id
+    let customerId = sub.stripe_customer_id as string | null
 
     if (!customerId) {
       const userRow = await query("SELECT username FROM users WHERE id = $1", [user.userId])
@@ -108,34 +101,32 @@ export async function stripeRoutes(fastify) {
     return { status: "ok", url: session.url, sessionId: session.id }
   })
 
-  // ─── Stripe webhook ───
-  fastify.post("/billing/webhook", async (request, reply) => {
-    const sig = request.headers["stripe-signature"]
-    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET
+  fastify.post("/billing/webhook", async (request: FastifyRequest, reply: FastifyReply) => {
+    const sig = request.headers["stripe-signature"] as string
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET || ""
 
-    let event
+    let event: Stripe.Event
     try {
-      // rawBody is set by our custom JSON parser in index.js
-      const rawBody = request.rawBody || JSON.stringify(request.body)
+      const rawBody = (request as unknown as { rawBody?: string }).rawBody || JSON.stringify(request.body)
       event = stripe.webhooks.constructEvent(rawBody, sig, webhookSecret)
     } catch (err) {
-      console.error("[stripe] Webhook signature verification failed:", err.message)
+      console.error("[stripe] Webhook signature verification failed:", (err as Error).message)
       return reply.code(400).send({ error: "Invalid signature" })
     }
 
     switch (event.type) {
       case "checkout.session.completed": {
-        const session = event.data.object
-        const userId = parseInt(session.metadata?.userId)
+        const session = event.data.object as Stripe.Checkout.Session
+        const userId = session.metadata?.userId
         const plan = session.metadata?.plan
-        if (userId && plan) {
-          const subscription = await stripe.subscriptions.retrieve(session.subscription)
+        if (userId && plan && session.subscription) {
+          const subscription = await stripe.subscriptions.retrieve(session.subscription as string)
           await updateSubscriptionFromStripe(userId, {
             plan,
-            stripeCustomerId: session.customer,
-            stripeSubscriptionId: session.subscription,
-            periodStart: stripeDate(subscription.current_period_start),
-            periodEnd: stripeDate(subscription.current_period_end),
+            stripeCustomerId: session.customer as string,
+            stripeSubscriptionId: session.subscription as string,
+            periodStart: stripeDate(subscription.current_period_start as number).toISOString(),
+            periodEnd: stripeDate(subscription.current_period_end as number).toISOString(),
             status: "active"
           })
           console.log(`[stripe] User ${userId} subscribed to ${plan}`)
@@ -144,15 +135,14 @@ export async function stripeRoutes(fastify) {
       }
 
       case "invoice.paid": {
-        // Renewal — reset credits
-        const invoice = event.data.object
-        const subId = invoice.subscription
+        const invoice = event.data.object as Stripe.Invoice
+        const subId = invoice.subscription as string | null
         if (subId) {
           const subRow = await query(
             "SELECT user_id, plan FROM subscriptions WHERE stripe_subscription_id = $1",
             [subId]
           )
-          if (subRow.rowCount > 0) {
+          if (subRow.rowCount! > 0) {
             const { user_id, plan } = subRow.rows[0]
             const planDef = PLANS[plan]
             if (planDef) {
@@ -167,8 +157,8 @@ export async function stripeRoutes(fastify) {
                  WHERE stripe_subscription_id = $4`,
                 [
                   planDef.creditsCents,
-                  stripeDate(subscription.current_period_start),
-                  stripeDate(subscription.current_period_end),
+                  stripeDate(subscription.current_period_start as number),
+                  stripeDate(subscription.current_period_end as number),
                   subId
                 ]
               )
@@ -180,12 +170,12 @@ export async function stripeRoutes(fastify) {
       }
 
       case "customer.subscription.deleted": {
-        const sub = event.data.object
+        const sub = event.data.object as Stripe.Subscription
         const subRow = await query(
           "SELECT user_id FROM subscriptions WHERE stripe_subscription_id = $1",
           [sub.id]
         )
-        if (subRow.rowCount > 0) {
+        if (subRow.rowCount! > 0) {
           await query(
             `UPDATE subscriptions SET plan = 'free', credits_cents = 0, credits_used_cents = 0,
              stripe_subscription_id = NULL, status = 'cancelled', updated_at = NOW()
@@ -204,9 +194,8 @@ export async function stripeRoutes(fastify) {
     return { received: true }
   })
 
-  // ─── SSE: CLI waits here for checkout completion (no polling, no WS) ───
-  fastify.get("/billing/checkout-stream", { logLevel: "warn" }, async (request, reply) => {
-    const { sessionId } = request.query
+  fastify.get("/billing/checkout-stream", { logLevel: "warn" }, async (request: FastifyRequest, reply: FastifyReply) => {
+    const { sessionId } = request.query as { sessionId?: string }
     if (!sessionId) return reply.code(400).send({ error: "sessionId required" })
 
     reply.raw.writeHead(200, {
@@ -215,7 +204,6 @@ export async function stripeRoutes(fastify) {
       Connection: "keep-alive"
     })
 
-    // Keep connection alive with heartbeat
     const heartbeat = setInterval(() => {
       reply.raw.write(": heartbeat\n\n")
     }, 15000)
@@ -226,39 +214,36 @@ export async function stripeRoutes(fastify) {
       reply.raw.end()
     })
 
-    // Cleanup on client disconnect
     request.raw.on("close", () => {
       clearInterval(heartbeat)
       removeCheckoutListener(sessionId)
     })
   })
 
-  // ─── Success page — fulfills subscription + notifies CLI via WS ───
-  fastify.get("/billing/success", async (request) => {
-    const sessionId = request.query.session_id
+  fastify.get("/billing/success", async (request: FastifyRequest) => {
+    const sessionId = (request.query as Record<string, string>).session_id
     if (sessionId) {
       try {
         const session = await stripe.checkout.sessions.retrieve(sessionId)
-        const userId = parseInt(session.metadata?.userId)
+        const userId = session.metadata?.userId
         const plan = session.metadata?.plan
 
         if (userId && plan && session.subscription) {
-          const subscription = await stripe.subscriptions.retrieve(session.subscription)
+          const subscription = await stripe.subscriptions.retrieve(session.subscription as string)
           await updateSubscriptionFromStripe(userId, {
             plan,
-            stripeCustomerId: session.customer,
-            stripeSubscriptionId: session.subscription,
-            periodStart: stripeDate(subscription.current_period_start),
-            periodEnd: stripeDate(subscription.current_period_end),
+            stripeCustomerId: session.customer as string,
+            stripeSubscriptionId: session.subscription as string,
+            periodStart: stripeDate(subscription.current_period_start as number).toISOString(),
+            periodEnd: stripeDate(subscription.current_period_end as number).toISOString(),
             status: "active"
           })
           console.log(`[stripe] Success page: activated ${plan} for user ${userId}`)
 
-          // Notify CLI WebSocket instantly
           emitCheckoutComplete(sessionId, { status: "paid", plan })
         }
       } catch (err) {
-        console.error("[stripe] Success page fulfillment error:", err.message)
+        console.error("[stripe] Success page fulfillment error:", (err as Error).message)
       }
     }
 
