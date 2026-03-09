@@ -51,8 +51,8 @@ export async function stripeRoutes(fastify: FastifyInstance): Promise<void> {
               plan,
               stripeCustomerId: sub.stripe_customer_id as string,
               stripeSubscriptionId: activeSub.id,
-              periodStart: stripeDate(activeSub.current_period_start as number).toISOString(),
-              periodEnd: stripeDate(activeSub.current_period_end as number).toISOString(),
+              periodStart: stripeDate((activeSub as unknown as Record<string, unknown>).current_period_start as number).toISOString(),
+              periodEnd: stripeDate((activeSub as unknown as Record<string, unknown>).current_period_end as number).toISOString(),
               status: "active"
             })
             console.log(`[stripe] Reconciled: activated ${plan} for user ${user.userId}`)
@@ -120,7 +120,7 @@ export async function stripeRoutes(fastify: FastifyInstance): Promise<void> {
         const userId = session.metadata?.userId
         const plan = session.metadata?.plan
         if (userId && plan && session.subscription) {
-          const subscription = await stripe.subscriptions.retrieve(session.subscription as string)
+          const subscription = await stripe.subscriptions.retrieve(session.subscription as string) as unknown as Record<string, unknown>
           await updateSubscriptionFromStripe(userId, {
             plan,
             stripeCustomerId: session.customer as string,
@@ -135,8 +135,8 @@ export async function stripeRoutes(fastify: FastifyInstance): Promise<void> {
       }
 
       case "invoice.paid": {
-        const invoice = event.data.object as Stripe.Invoice
-        const subId = invoice.subscription as string | null
+        const invoice = event.data.object as unknown as Record<string, unknown>
+        const subId = (invoice.subscription as string) || null
         if (subId) {
           const subRow = await query(
             "SELECT user_id, plan FROM subscriptions WHERE stripe_subscription_id = $1",
@@ -146,7 +146,7 @@ export async function stripeRoutes(fastify: FastifyInstance): Promise<void> {
             const { user_id, plan } = subRow.rows[0]
             const planDef = PLANS[plan]
             if (planDef) {
-              const subscription = await stripe.subscriptions.retrieve(subId)
+              const subscription = await stripe.subscriptions.retrieve(subId) as unknown as Record<string, unknown>
               await query(
                 `UPDATE subscriptions SET
                    credits_used_cents = 0,
@@ -229,7 +229,7 @@ export async function stripeRoutes(fastify: FastifyInstance): Promise<void> {
         const plan = session.metadata?.plan
 
         if (userId && plan && session.subscription) {
-          const subscription = await stripe.subscriptions.retrieve(session.subscription as string)
+          const subscription = await stripe.subscriptions.retrieve(session.subscription as string) as unknown as Record<string, unknown>
           await updateSubscriptionFromStripe(userId, {
             plan,
             stripeCustomerId: session.customer as string,

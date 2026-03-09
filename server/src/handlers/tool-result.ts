@@ -84,7 +84,7 @@ export async function handleToolResult(body: ToolResultBody): Promise<ClientResp
     })
 
     try {
-      await autoSaveContext(run, runLog, response)
+      await autoSaveContext(run as unknown as RunRecord, runLog, response)
     } catch (err) {
       console.error("[context] Failed to auto-save context:", (err as Error).message)
     }
