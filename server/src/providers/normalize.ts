@@ -1,4 +1,6 @@
-export function mapNormalizedResponseToClient(runId, normalized) {
+import type { NormalizedResponse, ClientResponse } from "../types.js"
+
+export function mapNormalizedResponseToClient(runId: string, normalized: NormalizedResponse): ClientResponse {
   switch (normalized.kind) {
     case "needs_tool":
       return {
