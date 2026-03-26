@@ -45,8 +45,9 @@ fastify.addHook("onClose", async () => {
 async function start(): Promise<void> {
   try {
     await initDatabase()
-    await fastify.listen({ port: 3000, host: "0.0.0.0" })
-    console.log("Sysflow API listening on http://localhost:3000")
+    const port = parseInt(process.env.SYS_PORT || "4000", 10)
+    await fastify.listen({ port, host: "0.0.0.0" })
+    console.log(`Sysflow API listening on http://localhost:${port}`)
   } catch (error) {
     console.error(error)
     process.exit(1)

@@ -1,5 +1,6 @@
 import type { ProviderPayload, NormalizedResponse, TokenUsage, ToolCall } from "../types.js"
 import { analyzeTaskComplexity, type TaskAnalysis } from "../services/completion-guard.js"
+import { actionPlanner } from "../services/action-planner.js"
 
 // ─── Tool Name Sanitizer: map hallucinated tool names to real ones ───
 
@@ -364,6 +365,12 @@ export abstract class BaseProvider {
         JSON.stringify(t.result).includes("Success!")
       )
     )
+
+    // Inject action planner context (if the planner transformed a broken tool call)
+    const plannerContext = actionPlanner.getPendingContext(payload.runId)
+    if (plannerContext) {
+      toolMsg += `\n\n${plannerContext}`
+    }
 
     // Append original task reminder — from memory or from payload
     const originalTask = this.runTasks.get(payload.runId) || payload.userMessage

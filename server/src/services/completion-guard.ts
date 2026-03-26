@@ -14,7 +14,7 @@ import { getRunActions } from "../store/sessions.js"
 
 export type TaskComplexity = "simple" | "medium" | "complex"
 
-interface TaskAnalysis {
+export interface TaskAnalysis {
   complexity: TaskComplexity
   expectedModules: string[]       // e.g., ["products", "orders", "customers", "auth"]
   expectedFrontendPages: string[] // e.g., ["product listing", "cart", "order history"]

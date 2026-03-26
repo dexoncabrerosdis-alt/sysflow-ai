@@ -136,6 +136,7 @@ Available tools and their args_json examples:
     USE THIS BEFORE running any scaffolding command you're not 100% sure about.
 
 CRITICAL RULES:
+- There is NO "batch_write" tool. To write multiple files at once, use the "tools" array with multiple write_file entries.
 - For write_file: args_json MUST include both "path" and "content". The "content" field must be the FULL file source code. Never leave content empty.
 - For edit_file: args_json MUST include both "path" and "patch". The "patch" field must be the FULL new file content.
 - args_json must be a valid JSON string.
@@ -159,6 +160,10 @@ CRITICAL RULES:
 - When creating a project: batch ALL write_file calls for independent files into one "tools" array.
 - When reading: batch ALL read_file calls together (up to 20). When searching: batch searches together.
 - Parallel is MUCH faster — 15 writes in one batch = same time as 1 write.
+- NEVER do sequential reads when you could batch them. If you need to read 3 files, send ONE "tools" array with 3 read_file calls.
+- NEVER do sequential edits when you could batch them. If you need to edit 3 files, send ONE "tools" array with 3 edit_file calls.
+- If you need to read THEN edit multiple files: Batch 1 = all reads in parallel, Batch 2 = all edits in parallel. ONLY 2 round trips, not 6.
+- Use batch_read instead of multiple read_file when you just need file content.
 
 ⚠️ ANTI-PREMATURE-COMPLETION (THE SERVER ENFORCES THIS):
 - The server WILL REJECT your "completed" response if you haven't created enough files.
@@ -235,12 +240,19 @@ When you finish a task (kind: "completed"), your "content" MUST include:
 2. NEXT STEPS — concrete instructions for the user (e.g. "Run npm install, then npm start")
 3. Any important notes or warnings
 
+FRAMEWORK RULES:
+- Next.js App Router: components with hooks (useState, useEffect, useRouter) MUST have 'use client' at top. Pages in app/ are Server Components by default. Import useRouter from 'next/navigation'.
+- NestJS: every controller needs @Controller(), every service needs @Injectable(), every module needs @Module(). Register all modules in app.module.ts.
+
 PATTERN SAVING:
 - Before saving, check if sysbase/patterns/ already has a file covering this topic — read existing patterns in your initial batch.
 - If pattern already exists with same content → skip. If it needs updating → edit_file. If genuinely new → write_file.
 - Save patterns for: new architectures, non-obvious conventions, non-trivial bugfixes.
 - Do NOT save for: basic CRUD, standard boilerplate, trivial changes, or content that's already saved.`
   }
+
+  // All broken-arg recovery, loop detection, and read-before-edit enforcement
+  // is handled by the ActionPlanner service in the handler layer.
 
   private getGenAI(): GoogleGenerativeAI {
     const key = process.env.GEMINI_API_KEY
@@ -290,6 +302,9 @@ PATTERN SAVING:
         normalized.usage = this.extractUsage(result)
         this.onSuccessfulCall()
 
+        // NOTE: broken args, loops, and tool transformations are handled by
+        // the ActionPlanner in tool-result.ts / user-message.ts (runs after provider returns)
+
         // Layer 2: provider-level completion validation
         normalized = this.validateCompletionResponse(payload.runId, normalized)
 
@@ -325,9 +340,14 @@ PATTERN SAVING:
       const result = await chat.sendMessage(toolMsg)
       const text = result.response.text()
 
-      const normalized = this.parseJsonResponse(text)
+      // ActionPlanner handles broken args and loops in the handler layer
+      let normalized = this.parseJsonResponse(text)
+
       normalized.usage = this.extractUsage(result)
       this.onSuccessfulCall()
+
+      // Layer 2: provider-level completion validation
+      normalized = this.validateCompletionResponse(payload.runId, normalized)
 
       if (normalized.kind === "completed" || normalized.kind === "failed") {
         this.clearRunState(payload.runId)
