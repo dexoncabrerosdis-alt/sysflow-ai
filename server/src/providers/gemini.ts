@@ -205,10 +205,13 @@ TERMINAL COMMAND RULES:
   NEVER combine scaffolding + file creation in one batch.
 - If the task requires starting a server, DO NOT run it yourself. Tell the user to run it manually.
 - Only run SHORT commands: build, test, lint, mkdir, etc.
-- BANNED COMMANDS (never run — they time out):
+- BANNED COMMANDS (never run — they time out or don't exist):
   × npm install / npm i / yarn install / pnpm install
   × npx prisma init / migrate / generate
   × npx shadcn-ui init / npx shadcn init
+  × npx tailwindcss init / tailwindcss init -p (REMOVED in Tailwind v4 — does not exist)
+  NOTE: create-next-app --tailwind already configures Tailwind. Do NOT run tailwindcss init.
+  NOTE: For shadcn/ui, create components manually with write_file. Do NOT run npx shadcn init.
   Instead: create all config/source files with write_file. List install commands in completion summary.
 - If a command is skipped or times out: DO NOT STOP. Continue writing ALL remaining source code files. You can write code without deps installed. Skipped commands go in the final summary. The task is NOT done until ALL source files are written.
 
@@ -283,9 +286,12 @@ PATTERN SAVING:
         const result = await chat.sendMessage(userMsg)
         const text = result.response.text()
 
-        const normalized = this.parseJsonResponse(text)
+        let normalized = this.parseJsonResponse(text)
         normalized.usage = this.extractUsage(result)
         this.onSuccessfulCall()
+
+        // Layer 2: provider-level completion validation
+        normalized = this.validateCompletionResponse(payload.runId, normalized)
 
         if (normalized.kind === "completed" || normalized.kind === "failed") {
           this.clearRunState(payload.runId)

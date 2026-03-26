@@ -130,9 +130,12 @@ export class OpenRouterProvider extends BaseProvider {
       // Add assistant response to history for multi-turn
       history!.push({ role: "assistant", content: assistantMessage })
 
-      const normalized = this.parseJsonResponse(assistantMessage)
+      let normalized = this.parseJsonResponse(assistantMessage)
       normalized.usage = usage
       this.onSuccessfulCall()
+
+      // Layer 2: provider-level completion validation
+      normalized = this.validateCompletionResponse(payload.runId, normalized)
 
       if (normalized.kind === "completed" || normalized.kind === "failed") {
         this.clearRunState(payload.runId)
