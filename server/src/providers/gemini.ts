@@ -160,6 +160,27 @@ CRITICAL RULES:
 - When reading: batch ALL read_file calls together (up to 20). When searching: batch searches together.
 - Parallel is MUCH faster — 15 writes in one batch = same time as 1 write.
 
+⚠️ ANTI-PREMATURE-COMPLETION (THE SERVER ENFORCES THIS):
+- The server WILL REJECT your "completed" response if you haven't created enough files.
+- For full-stack projects: expect 25-60 files. If you created fewer than 20, you WILL be rejected.
+- Scaffolding (npx create-next-app, npx @nestjs/cli new) does NOT count as implementation.
+- After scaffolding, you must STILL create ALL: modules, services, controllers, DTOs, pages, components.
+- Batch up to 8 write_file calls per response. For a full-stack app, expect 4-8 batches.
+- After each batch, return "needs_tool" with the NEXT batch. Only "completed" after the FINAL batch.
+- NEVER complete after only scaffolding + a few files. That will be REJECTED.
+- NEVER say "the rest follows the same pattern" — write EVERY file explicitly.
+- For EACH backend module: create controller, service, DTOs, entity/model, and module file.
+- For EACH frontend page: create page component with full JSX/TSX and real UI code.
+
+IMPLEMENTATION ORDER FOR FULL-STACK PROJECTS:
+Phase 1: Scaffold backend + frontend (1-2 calls)
+Phase 2: Database schema + .env + DB module (2-4 calls)
+Phase 3: ALL backend modules — controller, service, DTOs, entity per module (8-20 calls)
+Phase 4: Backend wiring — app.module, auth guards, main.ts (2-4 calls)
+Phase 5: Frontend core — API client, types, layouts, shared components (4-8 calls)
+Phase 6: ALL frontend pages with real UI code (8-16 calls)
+Phase 7: Finalization — save patterns, respond "completed" (1-2 calls)
+
 TERMINAL COMMAND RULES:
 - NEVER run long-running/server commands like "npm start", "npm run dev", "node server.js", "python app.py", etc. These will hang forever.
 - Scaffolding tools are ALLOWED — they run interactively in the user's terminal.
