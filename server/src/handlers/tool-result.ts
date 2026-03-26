@@ -79,16 +79,17 @@ export async function handleToolResult(body: ToolResultBody): Promise<ClientResp
   }
 
   if (isBatch) {
-    providerPayload.toolResults = body.toolResults
+    providerPayload.toolResults = enrichErrorResults(body.toolResults!)
     // Also set toolResult to first item for backwards compat
     providerPayload.toolResult = {
       tool: body.toolResults![0].tool,
       result: body.toolResults![0].result
     }
   } else {
+    const enriched = enrichSingleError(body.tool, body.result)
     providerPayload.toolResult = {
       tool: body.tool,
-      result: body.result
+      result: enriched
     }
   }
 
@@ -196,6 +197,51 @@ export async function handleToolResult(body: ToolResultBody): Promise<ClientResp
   }
 
   return response
+}
+
+// ─── Error enrichment: add recovery hints to tool errors before they reach the AI ───
+
+function enrichSingleError(tool: string, result: Record<string, unknown>): Record<string, unknown> {
+  const error = (result.error as string) || ""
+  if (!error) return result
+
+  const hint = getErrorRecoveryHint(tool, error)
+  if (!hint) return result
+
+  return { ...result, error: `${error}\n\n${hint}` }
+}
+
+function enrichErrorResults(results: Array<{ id: string; tool: string; result: Record<string, unknown> }>): Array<{ id: string; tool: string; result: Record<string, unknown> }> {
+  return results.map((tr) => ({
+    ...tr,
+    result: enrichSingleError(tr.tool, tr.result)
+  }))
+}
+
+function getErrorRecoveryHint(tool: string, error: string): string | null {
+  const isEnoent = error.includes("ENOENT") || error.includes("no such file") || error.includes("cannot find")
+  const isPermission = error.includes("EACCES") || error.includes("permission denied")
+  const isNotExecutable = error.includes("could not determine executable") || error.includes("not recognized")
+
+  if (isEnoent) {
+    if (tool === "list_directory" || tool === "read_file" || tool === "batch_read") {
+      return "⚠️ RECOVERY HINT: This file/directory does NOT exist. It was likely deleted or never created. Do NOT try to read it again. Instead, CREATE it from scratch using write_file or create_directory. If this was from a previous session, that work is gone — start fresh."
+    }
+    if (tool === "run_command") {
+      return "⚠️ RECOVERY HINT: The directory in this command does not exist. If you need to cd into a project folder, you must scaffold/create it first. Do NOT assume previous session directories still exist."
+    }
+    return "⚠️ RECOVERY HINT: File/directory not found. Create it instead of trying to read it."
+  }
+
+  if (isNotExecutable) {
+    return "⚠️ RECOVERY HINT: This command/package does not exist or has no executable. The command may be outdated (e.g., tailwindcss init was removed in v4). Skip this command and create the needed files manually with write_file."
+  }
+
+  if (isPermission) {
+    return "⚠️ RECOVERY HINT: Permission denied. Try a different approach or skip this action."
+  }
+
+  return null
 }
 
 interface RunRecord {
