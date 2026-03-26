@@ -113,7 +113,10 @@ async function getMigrations(): Promise<Array<{ name: string; up: string }>> {
     await import("./migrations/006_create_context_entries.js"),
     await import("./migrations/007_create_subscriptions.js"),
     await import("./migrations/008_create_usage_logs.js"),
-    await import("./migrations/009_alter_subscriptions_numeric.js")
+    await import("./migrations/009_alter_subscriptions_numeric.js"),
+    await import("./migrations/010_create_runs.js"),
+    await import("./migrations/011_create_tool_results.js"),
+    await import("./migrations/012_create_tasks.js")
   ]
   return mods.map((m) => m.default)
 }
