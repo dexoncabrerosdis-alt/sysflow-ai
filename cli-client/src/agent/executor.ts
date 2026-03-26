@@ -1,3 +1,5 @@
+import fs from "node:fs/promises"
+import path from "node:path"
 import readline from "node:readline"
 import chalk from "chalk"
 import { callServer, callServerStream } from "../lib/server.js"
@@ -14,8 +16,11 @@ import {
   runCommandTool,
   searchFilesTool,
   webSearchTool,
+  recoverFromCommandError,
+  searchForCommandFix,
   INTERACTIVE_PATTERNS
 } from "./tools.js"
+import { runVerification } from "./verifier.js"
 
 interface ToolResponse {
   tool: string
@@ -33,6 +38,24 @@ interface ToolCallEntry {
 // ─── Local tool execution (no server call) ───
 
 export async function executeToolLocally(tool: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  // ─── Arg validation: catch undefined/null args before they cause cryptic errors ───
+  if (!args) args = {}
+
+  // Tools that require a 'path' arg
+  if (["list_directory", "file_exists", "create_directory", "read_file", "write_file", "edit_file", "delete_file"].includes(tool)) {
+    if (!args.path && tool !== "write_file" && tool !== "edit_file") {
+      return { error: `Tool "${tool}" requires a "path" argument but received undefined. Check args.`, success: false }
+    }
+  }
+
+  // write_file/edit_file need both path and content
+  if (tool === "write_file" && (!args.path || !args.content)) {
+    return { error: `write_file requires "path" and "content" args. Got path=${args.path}, content=${args.content ? "present" : "missing"}`, success: false }
+  }
+  if (tool === "edit_file" && (!args.path || !args.patch)) {
+    return { error: `edit_file requires "path" and "patch" args. Got path=${args.path}, patch=${args.patch ? "present" : "missing"}`, success: false }
+  }
+
   switch (tool) {
     case "list_directory": {
       const entries = await listDirectoryTool(args.path as string)
@@ -101,13 +124,52 @@ export async function executeToolLocally(tool: string, args: Record<string, unkn
     }
 
     case "run_command": {
-      const output = await runCommandTool(args.command as string, (args.cwd as string) || process.cwd())
-      return { command: args.command, cwd: args.cwd || process.cwd(), ...output }
+      const cmd = args.command as string
+      const cmdCwd = (args.cwd as string) || process.cwd()
+      const output = await runCommandTool(cmd, cmdCwd)
+
+      // Post-scaffold verification: if command timed out or was interactive,
+      // check if the expected output directory was created
+      if (output.timedOut || output.interactive) {
+        const dirMatch = cmd.match(/(?:new|create-?\S*@?\S*)\s+(\S+)/)
+        if (dirMatch) {
+          const expectedDir = dirMatch[1]
+          const dirPath = path.resolve(cmdCwd, expectedDir)
+          try {
+            await fs.access(dirPath)
+            const entries = await fs.readdir(dirPath)
+            if (entries.length > 0) {
+              output.message = (output.message || "") + `\n✓ Verified: directory "${expectedDir}" exists with ${entries.length} files. Scaffolding succeeded.`
+              output.verified = true
+            }
+          } catch {
+            output.message = (output.message || "") + `\n⚠ Directory "${expectedDir}" was NOT created. Scaffolding may have failed.`
+            output.verified = false
+          }
+        }
+      }
+
+      return { command: args.command, cwd: cmdCwd, ...output }
     }
 
     case "web_search": {
       const results = await webSearchTool(args.query as string)
       return { query: args.query, results }
+    }
+
+    // ─── Hallucinated tool recovery: batch_write → multiple write_file ───
+    case "batch_write": {
+      const files = (args.files || []) as Array<{ path: string; content: string }>
+      const results: Array<{ path: string; success: boolean; error?: string }> = []
+      for (const file of files) {
+        try {
+          await writeFileTool(file.path, file.content)
+          results.push({ path: file.path, success: true })
+        } catch (err) {
+          results.push({ path: file.path, success: false, error: (err as Error).message })
+        }
+      }
+      return { files: results, totalWritten: results.filter((r) => r.success).length }
     }
 
     default:
@@ -191,8 +253,10 @@ export async function executeToolsBatch(
 
   // Execute ALL command tools one at a time (they share shell/stdin and may depend on each other)
   for (const tc of commandTools) {
-    const cmd = (tc.args.command as string) || tc.tool
+    let cmd = (tc.args.command as string) || tc.tool
     let result: Record<string, unknown> | null = null
+    let autoFixAttempted = false
+    let webSearchAttempted = false
 
     while (!result) {
       try {
@@ -204,6 +268,54 @@ export async function executeToolsBatch(
         result = r
       } catch (err) {
         const errMsg = (err as Error).message
+        cmd = (tc.args.command as string) || cmd
+
+        // ─── Smart recovery chain ───
+        const recovery = recoverFromCommandError(cmd, errMsg)
+
+        // Step 1: Auto-fix (known pattern)
+        if (recovery.action === "auto_fix" && recovery.fixedCommand && !autoFixAttempted) {
+          autoFixAttempted = true
+          console.log("")
+          console.log(chalk.yellow(`  ⚠ Command failed: `) + chalk.dim(cmd))
+          console.log(chalk.cyan(`    ↳ Auto-fix: `) + chalk.dim(recovery.description))
+          console.log(chalk.cyan(`    ↳ Trying: `) + chalk.white(recovery.fixedCommand))
+          tc.args = { ...tc.args, command: recovery.fixedCommand }
+          continue // retry with fixed command
+        }
+
+        // Step 2: Skip (known unfixable — e.g., tailwindcss init removed)
+        if (recovery.action === "skip") {
+          console.log("")
+          console.log(chalk.yellow(`  ⚠ Command skipped: `) + chalk.dim(cmd))
+          console.log(chalk.dim(`    ${recovery.description}`))
+          result = {
+            error: `Auto-skipped: ${recovery.description}`,
+            success: false,
+            skipped: true,
+            message: `SKIPPED: ${recovery.description}. Continue creating files with write_file. Do NOT stop.`
+          }
+          continue
+        }
+
+        // Step 3: Web search for unknown errors
+        if (recovery.action === "web_search" && !webSearchAttempted) {
+          webSearchAttempted = true
+          console.log("")
+          console.log(chalk.yellow(`  ⚠ Command failed: `) + chalk.dim(cmd))
+          console.log(chalk.cyan(`    ↳ Searching web for correct command...`))
+
+          const webFix = await searchForCommandFix(cmd, errMsg)
+          if (webFix) {
+            console.log(chalk.cyan(`    ↳ Found: `) + chalk.white(webFix))
+            console.log(chalk.dim(`    Retrying with web-suggested command...`))
+            tc.args = { ...tc.args, command: webFix }
+            continue // retry with web-found command
+          }
+          console.log(chalk.dim(`    ↳ No fix found via web search.`))
+        }
+
+        // Step 4: Last resort — ask user
         console.log("")
         console.log(chalk.red(`  ✖ Command failed: `) + chalk.dim(cmd))
         console.log(chalk.dim(`    ${errMsg.slice(0, 200)}`))
@@ -217,6 +329,8 @@ export async function executeToolsBatch(
         const answer = await askPrompt("  > ")
 
         if (answer === "r" || answer === "retry") {
+          autoFixAttempted = false  // allow auto-fix again on retry
+          webSearchAttempted = false
           continue // retry same command
         } else if (answer === "s" || answer === "skip") {
           result = { error: `Skipped by user: ${errMsg}`, success: false, skipped: true }
@@ -227,6 +341,8 @@ export async function executeToolsBatch(
             : answer
           if (newCmd) {
             tc.args = { ...tc.args, command: newCmd }
+            autoFixAttempted = false
+            webSearchAttempted = false
             continue // retry with new command
           } else {
             result = { error: `Skipped by user`, success: false, skipped: true }
@@ -243,6 +359,40 @@ export async function executeToolsBatch(
   // Sort results back to original order
   const orderMap = new Map(tools.map((t, i) => [t.id, i]))
   allResults.sort((a, b) => (orderMap.get(a.id) || 0) - (orderMap.get(b.id) || 0))
+
+  // ─── Auto-verification: run after write batches ───
+  const writtenFiles = allResults
+    .filter((r) => (r.tool === "write_file" || r.tool === "edit_file" || r.tool === "batch_write") && r.result.success !== false)
+    .flatMap((r) => {
+      if (r.tool === "batch_write" && Array.isArray(r.result.files)) {
+        return (r.result.files as Array<{ path: string; success: boolean }>).filter((f) => f.success).map((f) => f.path)
+      }
+      return [(r.result.path as string) || ""]
+    })
+    .filter(Boolean)
+
+  if (writtenFiles.length >= 3) {
+    // Run verification silently — only report if errors found
+    try {
+      const report = await runVerification(process.cwd(), writtenFiles, runId)
+      if (!report.overall) {
+        // Append verification result as a synthetic tool result
+        allResults.push({
+          id: `verify_${allResults.length}`,
+          tool: "_verification",
+          result: {
+            passed: false,
+            errors: report.checks.flatMap((c) => c.errors).slice(0, 15),
+            warnings: report.checks.flatMap((c) => c.warnings).slice(0, 5),
+            summary: report.summary,
+            success: false
+          }
+        })
+      }
+    } catch {
+      // Verification failed to run — don't block the flow
+    }
+  }
 
   const payload = {
     type: "tool_result",

@@ -113,6 +113,10 @@ function formatToolLabel(tool: string, args: Record<string, unknown>): string | 
       return colors.tool("run") + " " + colors.bright(args.command as string)
     case "web_search":
       return colors.tool("search web") + " " + colors.bright(`"${args.query}"`)
+    case "batch_write": {
+      const files = (args.files || []) as Array<{ path: string }>
+      return colors.tool("batch write") + " " + colors.muted(`${files.length} files`)
+    }
     default:
       return colors.tool(tool) + " " + colors.muted(JSON.stringify(args))
   }
@@ -351,6 +355,7 @@ export async function runAgent({ prompt, command = null, model = null }: RunAgen
   let lastDisplayedReasoning: string | null = null
 
   // ─── Task-driven persistence state ───
+  let clientCompletionRejections = 0  // client-side completion verification
   let rateLimitRetries = 0
   const MAX_RATE_LIMIT_RETRIES = 8       // total retries across all rate limit events
   let rateLimitBackoffMs = 5000           // starts at 5s, doubles each time
@@ -394,6 +399,52 @@ export async function runAgent({ prompt, command = null, model = null }: RunAgen
 
     switch (response.status) {
       case "completed": {
+        // ─── CLIENT-SIDE COMPLETION VERIFICATION ───
+        // Don't blindly trust "completed" — check if work actually matches the prompt
+        const completionMsg = ((response.message || response.content || "") as string).toLowerCase()
+        const isComplexPrompt = /full[- ]?stack|backend.*frontend|multiple\s+modules|end[- ]?to[- ]?end|crud.*auth|nestjs.*next/i.test(prompt)
+        const isShortCompletion = completionMsg.length < 150
+        const hasListedFiles = /files?\s*(created|modified|written)/i.test(completionMsg)
+        const tooFewSteps = stepCount < 5 && isComplexPrompt
+
+        // Reject completion if it looks premature
+        if (isComplexPrompt && (tooFewSteps || (isShortCompletion && !hasListedFiles)) && response.runId && clientCompletionRejections < 3) {
+          clientCompletionRejections++
+          spinner.stop()
+          console.log("")
+          console.log(colors.warning(`  ⚠ Task appears incomplete (${stepCount} steps for a complex task)`))
+          console.log(colors.muted(`    Auto-continuing... (attempt ${clientCompletionRejections}/3)`))
+          console.log("")
+
+          spinner.start(colors.muted("continuing task..."))
+          try {
+            response = await makeServerCall({
+              type: "tool_result",
+              runId: response.runId,
+              tool: "_completion_rejected",
+              result: {
+                error: `CLIENT REJECTION: The task is complex (full-stack) but only ${stepCount} steps were taken. The summary is too short and doesn't list files created. You MUST continue implementing. Create ALL backend modules, frontend pages, and configuration files before completing.`,
+                success: false,
+                originalTask: prompt,
+                hint: "Respond with needs_tool to continue implementation. Do NOT respond with completed again until ALL files are created."
+              }
+            }, (label) => { spinner.text = colors.muted(label) })
+          } catch {
+            response = await callServer({
+              type: "tool_result",
+              runId: response.runId,
+              tool: "_completion_rejected",
+              result: {
+                error: "Task incomplete. Continue implementing.",
+                success: false,
+                originalTask: prompt
+              }
+            })
+          }
+          break
+        }
+
+        // ─── Accept completion — display results ───
         spinner.stop()
 
         let message = (response.message || response.content) as string | null
