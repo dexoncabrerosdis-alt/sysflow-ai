@@ -583,10 +583,13 @@ SCAFFOLDING ORDER (CRITICAL — follow this exact sequence):
   For Prisma: create the prisma/schema.prisma file and .env file manually with write_file. Do NOT run npx prisma init — just write the files directly.
 - If the task requires starting a server, DO NOT run it yourself. Tell the user to run it manually.
 - Only run SHORT commands: build (npm run build), run tests (npm test), linting, mkdir, etc.
-- BANNED COMMANDS (never run these — they are slow and will time out):
+- BANNED COMMANDS (never run these — they are slow, will time out, or don't exist):
   × npm install / npm i / yarn install / pnpm install
   × npx prisma init / npx prisma migrate / npx prisma generate
   × npx shadcn-ui init / npx shadcn init
+  × npx tailwindcss init / tailwindcss init -p (REMOVED in Tailwind v4 — no longer exists)
+  NOTE: create-next-app --tailwind already configures Tailwind. Do NOT run tailwindcss init separately.
+  NOTE: For shadcn/ui, create the components manually with write_file. Do NOT run npx shadcn init.
   Instead: create all config/source files with write_file, and list install/setup commands in your completion summary.
 - If a command is skipped or times out: DO NOT STOP. Continue writing all remaining source code files. Skipped commands go in the final summary. The task is not done until ALL source files are written.
 - You can write source code files without dependencies installed. Write ALL modules, controllers, services, components, schemas, configs — then tell the user to install deps in the summary.
