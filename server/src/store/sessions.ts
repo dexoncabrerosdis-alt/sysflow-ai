@@ -54,6 +54,9 @@ export function recordRunAction(runId: string, tool: string, args: Record<string
   if (tool === "read_file" && args?.content) {
     action.contentPreview = (args.content as string).slice(0, 200)
   }
+  if (tool === "_user_response" && args?.answer) {
+    action.answer = (args.answer as string).slice(0, 500)
+  }
   log.actions.push(action)
 
   if ((tool === "write_file" || tool === "edit_file") && args?.path) {
@@ -247,6 +250,7 @@ export async function buildContinueContext(projectId: string, chatId?: string | 
 
   const allFilesCreated = new Set<string>()
   const allFilesModified = new Set<string>()
+  const userDecisions: string[] = []
   let lastError: string | null = null
 
   const lines: string[] = []
@@ -259,7 +263,11 @@ export async function buildContinueContext(projectId: string, chatId?: string | 
     if (session.actions.length > 0) {
       lines.push("  Steps taken:")
       for (const a of session.actions) {
-        if (a.tool === "write_file") {
+        if (a.tool === "_user_response") {
+          const answer = (a as Record<string, unknown>).answer || (a as Record<string, unknown>).output || ""
+          lines.push(`    - USER ANSWERED: "${answer}"`)
+          userDecisions.push(String(answer))
+        } else if (a.tool === "write_file") {
           lines.push(`    - Created file: ${a.path}`)
           if (a.path) allFilesCreated.add(a.path)
         } else if (a.tool === "edit_file") {
@@ -289,12 +297,32 @@ export async function buildContinueContext(projectId: string, chatId?: string | 
     }
   }
 
-  lines.push("\n=== SUMMARY ===")
+  // Find the ORIGINAL task prompt (first run in this chat)
+  const originalPrompt = recent.length > 0 ? recent[recent.length - 1].prompt : null
+  const lastPrompt = recent[0]?.prompt || null
+
+  lines.push("\n=== ORIGINAL TASK ===")
+  if (originalPrompt) {
+    lines.push(`ORIGINAL GOAL: "${originalPrompt}"`)
+  }
+  if (lastPrompt && lastPrompt !== originalPrompt) {
+    lines.push(`MOST RECENT PROMPT: "${lastPrompt}"`)
+  }
+
+  if (userDecisions.length > 0) {
+    lines.push("\n=== USER DECISIONS (from previous questions) ===")
+    for (const decision of userDecisions) {
+      lines.push(`- "${decision}"`)
+    }
+    lines.push("IMPORTANT: These are the user's confirmed choices. Do NOT ask about these again. Use them directly.")
+  }
+
+  lines.push("\n=== PROGRESS SUMMARY ===")
   if (allFilesCreated.size > 0) lines.push(`Files already created: ${[...allFilesCreated].join(", ")}`)
   if (allFilesModified.size > 0) lines.push(`Files already modified: ${[...allFilesModified].join(", ")}`)
   if (lastError) lines.push(`Last error: ${lastError.slice(0, 300)}`)
   lines.push("")
-  lines.push("INSTRUCTION: Continue from where the last run left off. Do NOT re-read files you already created. Do NOT redo completed steps. If the last run failed or was interrupted, fix the issue and continue. Focus only on what remains to be done.")
+  lines.push("INSTRUCTION: Your goal is to COMPLETE THE ORIGINAL TASK above. The user's technology choices are listed above — use them, do NOT ask again. Review what has been done and continue from where the last run left off. Do NOT re-read files you already created. Do NOT redo completed steps. Do NOT ask clarifying questions — all decisions are already made. Just implement.")
 
   return lines.join("\n")
 }

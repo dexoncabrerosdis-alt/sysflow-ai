@@ -78,7 +78,7 @@ function buildInitialTaskSteps({ command }: { prompt: string; command?: string }
   if (command === "/stash") {
     return toSteps(["Locate target sysbase content", "Move content to archive", "Complete task"])
   }
-  // Default: Catelis feature pipeline
+  // Default: feature pipeline
   return toSteps([
     "Inspect codebase and read relevant files",
     "Retrieve patterns and knowledge from context",

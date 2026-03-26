@@ -31,7 +31,16 @@ export async function handleToolResult(body: ToolResultBody): Promise<ClientResp
     await saveToolResult(body.runId, body.tool, body.result)
   }
 
-  const run = await getRun(body.runId)
+  let run: Awaited<ReturnType<typeof getRun>>
+  try {
+    run = await getRun(body.runId)
+  } catch {
+    return {
+      status: "failed",
+      runId: body.runId,
+      error: "Session expired. The server was restarted and lost this run's state. Please start a new prompt."
+    }
+  }
 
   // Record actions for each tool
   if (isBatch) {

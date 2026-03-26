@@ -31,7 +31,7 @@ interface QueryContextOpts {
   lifecycle?: string
 }
 
-// ─── Catelis pattern categories ───
+// ─── Pattern categories ───
 // api_pattern, db_pattern, migration_pattern, webhook_pattern,
 // sync_pattern, bugfix_pattern, architecture_pattern, operational_pattern,
 // memory, fix, pattern, preference, general
@@ -103,11 +103,11 @@ export async function getAllContext(projectId: string): Promise<ContextEntry[]> 
 export async function buildContextForPrompt(projectId: string, userPrompt: string): Promise<string | null> {
   const keywords = extractKeywords(userPrompt)
 
-  // Load patterns by Catelis categories — verified first, then candidates
+  // Load patterns by categories — verified first, then candidates
   const patterns = await queryContext(projectId, { category: "pattern", limit: 5 })
   const preferences = await queryContext(projectId, { category: "preference", limit: 3 })
 
-  // Load structured Catelis patterns (api, db, migration, etc.)
+  // Load structured patterns (api, db, migration, etc.)
   const apiPatterns = await queryContext(projectId, { category: "api_pattern", limit: 3 })
   const dbPatterns = await queryContext(projectId, { category: "db_pattern", limit: 3 })
   const archPatterns = await queryContext(projectId, { category: "architecture_pattern", limit: 3 })

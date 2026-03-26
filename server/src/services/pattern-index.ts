@@ -27,20 +27,20 @@ const cacheTimestamps = new Map<string, number>()
 // ─── Build index ───
 
 async function buildPatternIndex(cwd: string): Promise<PatternIndex | null> {
-  const catelisDir = path.join(cwd, "catelis-memory")
+  const sysbaseDir = path.join(cwd, "sysbase")
 
   try {
-    const stat = await fs.stat(catelisDir)
+    const stat = await fs.stat(sysbaseDir)
     if (!stat.isDirectory()) return null
   } catch {
     return null
   }
 
   const entries: PatternEntry[] = []
-  const dirs = ["architecture", "patterns", "conventions", "stack", "status"]
+  const dirs = ["architecture", "patterns", "conventions", "stack", "status", "decisions", "fixes"]
 
   for (const dir of dirs) {
-    const dirPath = path.join(catelisDir, dir)
+    const dirPath = path.join(sysbaseDir, dir)
     let files: string[]
     try {
       files = (await fs.readdir(dirPath)).filter((f) => f.endsWith(".md"))
@@ -145,7 +145,7 @@ export async function getRelevantPatterns(cwd: string, prompt: string, limit?: n
   return queryPatternIndex(index, prompt, limit)
 }
 
-/** Force rebuild the index (after catelis-memory files change) */
+/** Force rebuild the index (after sysbase knowledge files change) */
 export function invalidatePatternIndex(cwd: string): void {
   indexCache.delete(cwd)
   cacheTimestamps.delete(cwd)
