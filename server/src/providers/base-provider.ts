@@ -1,4 +1,5 @@
 import type { ProviderPayload, NormalizedResponse, TokenUsage, ToolCall } from "../types.js"
+import { analyzeTaskComplexity, type TaskAnalysis } from "../services/completion-guard.js"
 
 // ─── Tool Name Sanitizer: map hallucinated tool names to real ones ───
 
@@ -37,6 +38,68 @@ const TOOL_ALIASES: Record<string, string> = {
   "create_files": "batch_write",
   "write_files": "batch_write",
   "multi_write": "batch_write",
+}
+
+/**
+ * Robustly parse args_json with multiple fallback strategies.
+ * Handles: valid JSON strings, already-parsed objects, malformed JSON,
+ * double-encoded strings, and single-quoted JSON.
+ */
+function parseArgsRobust(argsJson: unknown, argsFallback: unknown, tool?: string): Record<string, unknown> {
+  // Strategy 1: args_json is already an object
+  if (argsJson && typeof argsJson === "object" && !Array.isArray(argsJson)) {
+    const obj = argsJson as Record<string, unknown>
+    if (Object.keys(obj).length > 0) return obj
+  }
+
+  // Strategy 2: args_json is a valid JSON string
+  if (typeof argsJson === "string" && argsJson.trim()) {
+    // Try direct parse
+    try {
+      const parsed = JSON.parse(argsJson)
+      if (parsed && typeof parsed === "object") return parsed as Record<string, unknown>
+    } catch { /* try fallbacks */ }
+
+    // Strategy 3: double-encoded JSON (string inside string)
+    try {
+      const unescaped = JSON.parse(`"${argsJson.replace(/"/g, '\\"')}"`)
+      if (typeof unescaped === "string") {
+        const parsed = JSON.parse(unescaped)
+        if (parsed && typeof parsed === "object") return parsed as Record<string, unknown>
+      }
+    } catch { /* try next */ }
+
+    // Strategy 4: fix common JSON issues (single quotes, trailing commas)
+    try {
+      const fixed = argsJson
+        .replace(/'/g, '"')                    // single → double quotes
+        .replace(/,\s*([}\]])/g, "$1")         // trailing commas
+        .replace(/(\w+)\s*:/g, '"$1":')        // unquoted keys
+      const parsed = JSON.parse(fixed)
+      if (parsed && typeof parsed === "object") return parsed as Record<string, unknown>
+    } catch { /* try next */ }
+
+    // Strategy 5: regex extraction — pull path and content/patch from the string
+    const pathMatch = argsJson.match(/"path"\s*:\s*"([^"]+)"/)
+    if (pathMatch) {
+      const extracted: Record<string, unknown> = { path: pathMatch[1] }
+      const contentMatch = argsJson.match(/"content"\s*:\s*"((?:[^"\\]|\\.)*)"/)
+      const patchMatch = argsJson.match(/"patch"\s*:\s*"((?:[^"\\]|\\.)*)"/)
+      if (contentMatch) extracted.content = contentMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"')
+      if (patchMatch) extracted.patch = patchMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"')
+      console.warn(`[args-parser] Recovered args via regex for ${tool || "unknown"}: path=${extracted.path}`)
+      return extracted
+    }
+
+    console.error(`[args-parser] FAILED to parse args_json for ${tool || "unknown"}:`, argsJson.slice(0, 200))
+  }
+
+  // Strategy 6: use args fallback (non-Gemini providers use args directly)
+  if (argsFallback && typeof argsFallback === "object") {
+    return argsFallback as Record<string, unknown>
+  }
+
+  return {}
 }
 
 function sanitizeToolName(tool: string): string {
@@ -168,6 +231,8 @@ export abstract class BaseProvider {
     this.runTasks.delete(runId)
     this.runFileCount.delete(runId)
     this.runToolCount.delete(runId)
+    this.runAnalysis.delete(runId)
+    this.runFilePaths.delete(runId)
   }
 
   /** Store the original task for this run */
@@ -246,6 +311,10 @@ export abstract class BaseProvider {
   /** Track files written per run for continuation awareness */
   protected runFileCount = new Map<string, number>()
   protected runToolCount = new Map<string, number>()
+  /** Cached task analysis per run */
+  protected runAnalysis = new Map<string, TaskAnalysis>()
+  /** Track file paths written per run */
+  protected runFilePaths = new Map<string, string[]>()
 
   /** Build tool result message with original task reminder and continuation enforcement */
   protected buildToolResultMessage(payload: ProviderPayload): string {
@@ -267,13 +336,23 @@ export abstract class BaseProvider {
     // Track progress
     const fileCount = this.runFileCount.get(payload.runId) || 0
     const toolCount = this.runToolCount.get(payload.runId) || 0
+    const existingPaths = this.runFilePaths.get(payload.runId) || []
     const newWrites = tools.filter((t) => t.tool === "write_file" || t.tool === "edit_file").length
     const newCommands = tools.filter((t) => t.tool === "run_command").length
+    const newPaths = tools
+      .filter((t) => t.tool === "write_file" || t.tool === "edit_file")
+      .map((t) => {
+        const r = t.result as Record<string, unknown>
+        return (r.path as string) || ""
+      })
+      .filter(Boolean)
     this.runFileCount.set(payload.runId, fileCount + newWrites)
     this.runToolCount.set(payload.runId, toolCount + tools.length)
+    this.runFilePaths.set(payload.runId, [...existingPaths, ...newPaths])
 
     const totalFiles = fileCount + newWrites
     const totalTools = toolCount + tools.length
+    const allPaths = [...existingPaths, ...newPaths]
 
     // Detect scaffold-only results (commands returned but no files written yet)
     const isScaffoldResult = newCommands > 0 && totalFiles === 0
@@ -304,6 +383,43 @@ export abstract class BaseProvider {
         toolMsg += `\nExpect 25-60 more write_file calls. DO NOT respond with "completed". Respond with "needs_tool".`
       } else if (totalFiles < 15 && totalTools > 2) {
         toolMsg += `\n\nPROGRESS: ${totalFiles} files created so far. For a full-stack project, you need 25-60 files total. Keep going with "needs_tool".`
+      }
+
+      // Module-aware progress: show which modules still need files
+      if (totalFiles > 0 && originalTask) {
+        if (!this.runAnalysis.has(payload.runId)) {
+          this.runAnalysis.set(payload.runId, analyzeTaskComplexity(originalTask))
+        }
+        const analysis = this.runAnalysis.get(payload.runId)!
+
+        if (analysis.complexity !== "simple" && (analysis.expectedModules.length > 0 || analysis.expectedFrontendPages.length > 0)) {
+          const doneModules: string[] = []
+          const missingModules: string[] = []
+          for (const mod of analysis.expectedModules) {
+            const hasFiles = allPaths.some((p) => p.toLowerCase().includes(mod.toLowerCase()) || p.toLowerCase().includes(mod.replace(/s$/, "").toLowerCase()))
+            if (hasFiles) doneModules.push(mod)
+            else missingModules.push(mod)
+          }
+
+          const donePages: string[] = []
+          const missingPages: string[] = []
+          for (const page of analysis.expectedFrontendPages) {
+            const pageKey = page.split(" ")[0].toLowerCase()
+            const hasFiles = allPaths.some((p) => p.toLowerCase().includes(pageKey))
+            if (hasFiles) donePages.push(page)
+            else missingPages.push(page)
+          }
+
+          const parts: string[] = []
+          if (doneModules.length > 0) parts.push(`✓ Modules done: ${doneModules.join(", ")}`)
+          if (missingModules.length > 0) parts.push(`✗ Modules remaining: ${missingModules.join(", ")}`)
+          if (donePages.length > 0) parts.push(`✓ Pages done: ${donePages.join(", ")}`)
+          if (missingPages.length > 0) parts.push(`✗ Pages remaining: ${missingPages.join(", ")}`)
+
+          if (parts.length > 0) {
+            toolMsg += `\n\n═══ TASK PROGRESS ═══\n${parts.join("\n")}\n═══ END PROGRESS ═══`
+          }
+        }
       }
 
       toolMsg += `\nYou are NOT done until the ENTIRE task above is fully implemented. Respond with "needs_tool" to continue.`
@@ -427,16 +543,7 @@ export abstract class BaseProvider {
       // Check for parallel tools array first
       if (Array.isArray(json.tools) && json.tools.length > 0) {
         normalized.tools = (json.tools as Array<Record<string, unknown>>).map((tc, i) => {
-          let args: Record<string, unknown> = {}
-          if (tc.args_json) {
-            try {
-              args = typeof tc.args_json === "string"
-                ? JSON.parse(tc.args_json as string)
-                : tc.args_json as Record<string, unknown>
-            } catch { args = {} }
-          } else if (tc.args) {
-            args = tc.args as Record<string, unknown>
-          }
+          const args = parseArgsRobust(tc.args_json, tc.args, tc.tool as string)
           return {
             id: (tc.id as string) || `tc_${i}`,
             tool: tc.tool as string,
@@ -449,20 +556,7 @@ export abstract class BaseProvider {
       } else {
         // Single tool (existing path)
         normalized.tool = json.tool as string
-
-        if (json.args_json) {
-          try {
-            normalized.args = typeof json.args_json === "string"
-              ? JSON.parse(json.args_json)
-              : json.args_json as Record<string, unknown>
-          } catch {
-            normalized.args = {}
-          }
-        } else if (json.args) {
-          normalized.args = json.args as Record<string, unknown>
-        } else {
-          normalized.args = {}
-        }
+        normalized.args = parseArgsRobust(json.args_json, json.args, json.tool as string)
       }
     }
 
@@ -959,6 +1053,22 @@ Phase 7 — FINALIZATION (2-4 tool calls)
   - Respond with "completed" and a detailed summary
 
 TOTAL: 25-60 tool calls for a full-stack project. If you're at tool call #5 and thinking about completing, you are NOT done.
+
+═══ FRAMEWORK-SPECIFIC RULES ═══
+
+NEXT.JS (App Router):
+- Any component using hooks (useState, useEffect, useRouter, etc.) MUST have 'use client' at the top of the file
+- Page files in app/ directory are Server Components by default — they CANNOT use hooks
+- For interactive components: create them in a components/ folder with 'use client' directive
+- Layout files (layout.tsx) are Server Components — do NOT use hooks in them
+- Import useRouter from 'next/navigation' (NOT 'next/router')
+
+NESTJS:
+- Every controller needs @Controller() decorator
+- Every service needs @Injectable() decorator
+- Every module needs @Module() with imports, controllers, providers
+- Register ALL modules in app.module.ts
+- Use ValidationPipe globally in main.ts
 
 ═══ HARD RULES ═══
 
