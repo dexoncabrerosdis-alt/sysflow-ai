@@ -78,16 +78,16 @@ export class SweProvider extends BaseProvider {
       title: "Build auth system",
       goal: "Create a complete JWT-based authentication system with signup, login, route guards, user management, and tests.",
       steps: [
-        { label: "Understand codebase", status: "pending" },
-        { label: "Set up project structure", status: "pending" },
-        { label: "Create utility modules", status: "pending" },
-        { label: "Build service layer", status: "pending" },
-        { label: "Add auth middleware", status: "pending" },
-        { label: "Create API routes", status: "pending" },
-        { label: "Wire up app entry point", status: "pending" },
-        { label: "Add dependencies", status: "pending" },
-        { label: "Write tests", status: "pending" },
-        { label: "Save patterns to sysbase", status: "pending" }
+        { id: "step_0", label: "Understand codebase", status: "pending" },
+        { id: "step_1", label: "Set up project structure", status: "pending" },
+        { id: "step_2", label: "Create utility modules", status: "pending" },
+        { id: "step_3", label: "Build service layer", status: "pending" },
+        { id: "step_4", label: "Add auth middleware", status: "pending" },
+        { id: "step_5", label: "Create API routes", status: "pending" },
+        { id: "step_6", label: "Wire up app entry point", status: "pending" },
+        { id: "step_7", label: "Add dependencies", status: "pending" },
+        { id: "step_8", label: "Write tests", status: "pending" },
+        { id: "step_9", label: "Save patterns to sysbase", status: "pending" }
       ],
       status: "running"
     }

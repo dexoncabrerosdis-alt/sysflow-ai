@@ -17,18 +17,48 @@ const RESPONSE_SCHEMA = {
     },
     tool: {
       type: SchemaType.STRING,
-      description: "The tool to use. Required when kind is needs_tool.",
+      description: "The tool to use (single tool mode). Required when kind is needs_tool and tools array is not used.",
       nullable: true,
       enum: [
         "list_directory", "read_file", "batch_read", "write_file",
-        "edit_file", "create_directory", "search_code", "run_command",
-        "move_file", "delete_file"
+        "edit_file", "create_directory", "search_code", "search_files",
+        "run_command", "move_file", "delete_file"
       ]
     },
     args_json: {
       type: SchemaType.STRING,
-      description: "JSON string of tool arguments. Required when kind is needs_tool. MUST be valid JSON.",
+      description: "JSON string of tool arguments (single tool mode). MUST be valid JSON.",
       nullable: true
+    },
+    tools: {
+      type: SchemaType.ARRAY,
+      description: "Array of tool calls for parallel execution. Use INSTEAD of tool/args_json when calling multiple independent tools at once.",
+      nullable: true,
+      items: {
+        type: SchemaType.OBJECT,
+        properties: {
+          id: { type: SchemaType.STRING, description: "Unique ID like tc_0, tc_1" },
+          tool: {
+            type: SchemaType.STRING,
+            enum: [
+              "list_directory", "read_file", "batch_read", "write_file",
+              "edit_file", "create_directory", "search_code", "search_files",
+              "run_command", "move_file", "delete_file"
+            ]
+          },
+          args_json: { type: SchemaType.STRING, description: "JSON string of tool arguments" }
+        },
+        required: ["id", "tool", "args_json"]
+      }
+    },
+    stepTransition: {
+      type: SchemaType.OBJECT,
+      description: "Step transition to mark pipeline progress",
+      nullable: true,
+      properties: {
+        complete: { type: SchemaType.STRING, description: "Step ID to mark completed", nullable: true },
+        start: { type: SchemaType.STRING, description: "Step ID to mark in_progress", nullable: true }
+      }
     },
     content: {
       type: SchemaType.STRING,
@@ -104,7 +134,8 @@ CRITICAL RULES:
 - If something already exists but the user asks you to work on it, CHECK if it actually works first.
 - Always include "reasoning" with a short explanation.
 - Write complete, production-quality code.
-- Do one action at a time. You will be called again with the tool result.
+- Use the "tools" array to call multiple independent tools in parallel for speed. You will be called again with all results at once.
+- For single actions, use "tool" and "args_json" as before.
 
 TERMINAL COMMAND RULES:
 - NEVER run long-running/server commands like "npm start", "npm run dev", "node server.js", "python app.py", etc. These will hang forever.
@@ -142,7 +173,7 @@ MEMORY RULES:
     const geminiModelName = this.getModelName(payload.model)
 
     try {
-      if (!payload.toolResult) {
+      if (!payload.toolResult && !payload.toolResults) {
         // First call — create a new chat session
         const model = genAI.getGenerativeModel({
           model: geminiModelName,
@@ -192,14 +223,22 @@ MEMORY RULES:
         this.runState.set(payload.runId, chat)
       }
 
-      const toolResultStr = JSON.stringify({
-        tool: payload.toolResult.tool,
-        result: payload.toolResult.result
-      })
+      let toolMsg: string
+      if (payload.toolResults && payload.toolResults.length > 0) {
+        // Batch tool results
+        const batchStr = payload.toolResults
+          .map((r) => `[${r.id}] ${r.tool}: ${JSON.stringify(r.result)}`)
+          .join("\n")
+        toolMsg = `Tool results (parallel):\n${batchStr}\n\nDecide the next action.`
+      } else {
+        // Single tool result
+        toolMsg = `Tool result:\n${JSON.stringify({
+          tool: payload.toolResult!.tool,
+          result: payload.toolResult!.result
+        })}\n\nDecide the next action.`
+      }
 
-      const result = await chat.sendMessage(
-        `Tool result:\n${toolResultStr}\n\nDecide the next action.`
-      )
+      const result = await chat.sendMessage(toolMsg)
       const text = result.response.text()
 
       const normalized = this.parseJsonResponse(text)

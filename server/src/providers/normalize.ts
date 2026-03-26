@@ -8,10 +8,12 @@ export function mapNormalizedResponseToClient(runId: string, normalized: Normali
         runId,
         tool: normalized.tool,
         args: normalized.args,
+        tools: normalized.tools || undefined,
         content: normalized.content || null,
         reasoning: normalized.reasoning || null,
         task: normalized.task || null,
-        taskStep: normalized.taskStep || null
+        taskStep: normalized.taskStep || null,
+        stepTransition: normalized.stepTransition || undefined
       }
 
     case "waiting_for_user":

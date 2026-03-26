@@ -4,8 +4,9 @@ import chalk from "chalk"
 import ora from "ora"
 import { callServer } from "../lib/server.js"
 import { ensureSysbase, getSelectedModel, getSysbasePath, getReasoningEnabled, getAuthToken } from "../lib/sysbase.js"
-import { executeTool } from "./executor.js"
-import { scanDirectoryTree, readFileTool, computeLineDiff } from "./tools.js"
+import { executeTool, executeToolsBatch } from "./executor.js"
+import { readFileTool, computeLineDiff } from "./tools.js"
+import { getOrBuildIndex, compactTree } from "./indexer.js"
 import { ensureActiveChat } from "../commands/chats.js"
 
 interface ServerError extends Error {
@@ -65,6 +66,8 @@ function formatToolLabel(tool: string, args: Record<string, unknown>): string | 
       return chalk.blue("check") + " " + args.path
     case "search_code":
       return chalk.blue("search") + ` "${args.pattern}"`
+    case "search_files":
+      return chalk.blue("find") + ` "${args.query || args.glob}"`
     case "run_command":
       return chalk.blue("run") + " " + args.command
     default:
@@ -129,7 +132,8 @@ export async function runAgent({ prompt, command = null, model = null }: RunAgen
     }
   }
 
-  const dirTree = await scanDirectoryTree(process.cwd())
+  const fileIndex = await getOrBuildIndex(process.cwd(), getSysbasePath())
+  const dirTree = compactTree(fileIndex)
 
   console.log("")
 
@@ -170,7 +174,7 @@ export async function runAgent({ prompt, command = null, model = null }: RunAgen
 
   let stepCount = 0
   let taskShown = false
-  let taskSteps: Array<{ id: string; label: string }> = []
+  let taskSteps: Array<{ id: string; label: string; status?: string }> = []
   const completedSteps = new Set<string>()
   let consecutiveErrors = 0
   const MAX_CONSECUTIVE_ERRORS = 3
@@ -200,7 +204,7 @@ export async function runAgent({ prompt, command = null, model = null }: RunAgen
 
         if (taskSteps.length > 0) {
           console.log(chalk.dim("  ───────────────────────────────────"))
-          console.log(chalk.white.bold(`  ${completedSteps.size}/${taskSteps.length} tasks completed`))
+          console.log(chalk.white.bold(`  ${completedSteps.size}/${taskSteps.length} steps completed`))
           console.log("")
           for (const s of taskSteps) {
             if (completedSteps.has(s.id)) {
@@ -247,6 +251,88 @@ export async function runAgent({ prompt, command = null, model = null }: RunAgen
       case "needs_tool": {
         stepCount++
 
+        // Handle step transitions from AI
+        const stepTransition = response.stepTransition as { complete?: string; start?: string } | undefined
+        if (stepTransition) {
+          if (stepTransition.complete) {
+            completedSteps.add(stepTransition.complete)
+          }
+        }
+
+        const toolCalls = response.tools as Array<{ id: string; tool: string; args: Record<string, unknown> }> | undefined
+        const isParallel = toolCalls && toolCalls.length > 1
+
+        // Show task on first tool call
+        const task = response.task as Record<string, unknown> | null
+        if (task && !taskShown) {
+          spinner.stop()
+          taskShown = true
+          taskSteps = (task.steps || []) as Array<{ id: string; label: string; status?: string }>
+          console.log("")
+          console.log(chalk.white.bold(`  TASK: ${task.title}`))
+          console.log(chalk.dim(`  ${task.goal}`))
+          console.log("")
+          for (const s of taskSteps) {
+            const icon = s.status === "completed" ? chalk.green("[x]") :
+                         s.status === "in_progress" ? chalk.cyan("[>]") :
+                         chalk.dim("[ ]")
+            console.log(`  ${icon} ${s.status === "completed" ? chalk.green(s.label) : s.status === "in_progress" ? chalk.cyan(s.label) : chalk.dim(s.label)}`)
+          }
+          console.log("")
+        }
+
+        // Update step display from task in response
+        if (task?.steps) {
+          const steps = task.steps as Array<{ id: string; status?: string }>
+          for (const s of steps) {
+            if (s.status === "completed" && s.id) completedSteps.add(s.id)
+          }
+        }
+
+        if (isParallel) {
+          // ═══ PARALLEL EXECUTION PATH ═══
+          spinner.stop()
+
+          if (hasReasoning && response.reasoning) {
+            await typeReasoning(response.reasoning as string)
+          }
+
+          console.log(chalk.cyan("    ┌ parallel ") + chalk.dim(`(${toolCalls!.length} tools)`))
+          for (const tc of toolCalls!) {
+            const label = formatToolLabel(tc.tool, tc.args)
+            console.log(chalk.cyan("    │ ") + (label || `${tc.tool} ${JSON.stringify(tc.args)}`))
+          }
+
+          spinner.start(chalk.dim(`executing ${toolCalls!.length} tools...`))
+
+          try {
+            response = await executeToolsBatch(toolCalls!, response.runId as string)
+            consecutiveErrors = 0
+            spinner.stop()
+            console.log(chalk.green("    └ done"))
+            spinner.start(chalk.dim("thinking..."))
+          } catch (batchError) {
+            consecutiveErrors++
+            spinner.stop()
+            console.log(chalk.red("    └ error: ") + chalk.dim((batchError as Error).message))
+
+            if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+              console.log(chalk.red(`\n  aborted: ${MAX_CONSECUTIVE_ERRORS} consecutive errors`))
+              throw new Error("Too many consecutive tool errors")
+            }
+
+            spinner.start(chalk.dim("thinking..."))
+            response = await callServer({
+              type: "tool_result",
+              runId: response.runId,
+              tool: "_recovery",
+              result: { error: (batchError as Error).message, success: false }
+            })
+          }
+          break
+        }
+
+        // ═══ SINGLE TOOL PATH ═══
         const pendingTaskStep = (response.taskStep as string) || null
         const args = response.args as Record<string, unknown>
 
@@ -267,20 +353,6 @@ export async function runAgent({ prompt, command = null, model = null }: RunAgen
             await typeReasoning(response.reasoning as string)
           } else {
             spinner.stop()
-          }
-
-          const task = response.task as Record<string, unknown> | null
-          if (task && !taskShown) {
-            taskShown = true
-            taskSteps = (task.steps || []) as Array<{ id: string; label: string }>
-            console.log("")
-            console.log(chalk.white.bold(`  TASK: ${task.title}`))
-            console.log(chalk.dim(`  ${task.goal}`))
-            console.log("")
-            for (const s of taskSteps) {
-              console.log(chalk.dim(`  [ ] ${s.label}`))
-            }
-            console.log("")
           }
 
           if (response.tool === "batch_read") {

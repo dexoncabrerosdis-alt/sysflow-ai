@@ -12,6 +12,18 @@ export interface ToolResult {
   result: Record<string, unknown>
 }
 
+export interface ToolCall {
+  id: string
+  tool: string
+  args: Record<string, unknown>
+}
+
+export interface BatchToolResult {
+  id: string
+  tool: string
+  result: Record<string, unknown>
+}
+
 export interface ProviderPayload {
   model: string
   runId: string
@@ -19,6 +31,7 @@ export interface ProviderPayload {
   directoryTree: DirectoryEntry[]
   context: ProviderContext
   toolResult?: ToolResult
+  toolResults?: BatchToolResult[]
   task?: TaskMeta
   userId?: string | null
   chatId?: string | null
@@ -53,17 +66,20 @@ export interface NormalizedResponse {
   reasoning?: string | null
   tool?: string
   args?: Record<string, unknown>
+  tools?: ToolCall[]
   error?: string
   usage: TokenUsage
   summary?: string | null
   task?: TaskMeta | null
-  taskStep?: unknown
+  taskStep?: string | null
+  stepTransition?: { complete?: string; start?: string }
   pendingAction?: unknown
 }
 
 // ─── Task ───
 
 export interface TaskStep {
+  id: string
   label: string
   status: "pending" | "in_progress" | "completed" | "failed"
 }
@@ -98,12 +114,14 @@ export interface ClientResponse {
   runId: string
   tool?: string
   args?: Record<string, unknown>
+  tools?: ToolCall[]
   content?: string | null
   reasoning?: string | null
   message?: string | null
   summary?: string | null
   task?: TaskMeta | null
-  taskStep?: unknown
+  taskStep?: string | null
+  stepTransition?: { complete?: string; start?: string }
   pendingAction?: unknown
   error?: string
 }

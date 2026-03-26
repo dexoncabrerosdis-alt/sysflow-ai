@@ -31,7 +31,7 @@ export class OpenRouterProvider extends BaseProvider {
     try {
       let history = this.runState.get(payload.runId) as ChatMessage[] | undefined
 
-      if (!payload.toolResult) {
+      if (!payload.toolResult && !payload.toolResults) {
         // First call — new conversation
         history = [
           { role: "system", content: this.systemPrompt },
@@ -39,27 +39,31 @@ export class OpenRouterProvider extends BaseProvider {
         ]
         this.runState.set(payload.runId, history)
       } else {
-        // Continuation — add tool result to history
+        // Continuation — add tool result(s) to history
+        let toolMsg: string
+
+        if (payload.toolResults && payload.toolResults.length > 0) {
+          // Batch results
+          const batchStr = payload.toolResults
+            .map((r) => `[${r.id}] ${r.tool}: ${JSON.stringify(r.result)}`)
+            .join("\n")
+          toolMsg = `Tool results (parallel):\n${batchStr}\n\nDecide the next action.`
+        } else {
+          // Single result
+          toolMsg = `Tool result:\n${JSON.stringify({
+            tool: payload.toolResult!.tool,
+            result: payload.toolResult!.result
+          })}\n\nDecide the next action.`
+        }
+
         if (!history) {
           history = [
             { role: "system", content: this.systemPrompt },
-            {
-              role: "user",
-              content: `Previous tool result:\n${JSON.stringify({
-                tool: payload.toolResult.tool,
-                result: payload.toolResult.result
-              })}\n\nDecide the next action.`
-            }
+            { role: "user", content: `Previous ${toolMsg}` }
           ]
           this.runState.set(payload.runId, history)
         } else {
-          history.push({
-            role: "user",
-            content: `Tool result:\n${JSON.stringify({
-              tool: payload.toolResult.tool,
-              result: payload.toolResult.result
-            })}\n\nDecide the next action.`
-          })
+          history.push({ role: "user", content: toolMsg })
         }
       }
 
