@@ -1,5 +1,66 @@
 import type { ProviderPayload, NormalizedResponse, TokenUsage, ToolCall } from "../types.js"
 
+// ─── Tool Name Sanitizer: map hallucinated tool names to real ones ───
+
+const VALID_TOOLS = new Set([
+  "list_directory", "read_file", "batch_read", "write_file",
+  "edit_file", "create_directory", "search_code", "search_files",
+  "run_command", "move_file", "delete_file", "web_search",
+  "file_exists", "batch_write"  // batch_write handled as fallback in client
+])
+
+/** Map of commonly hallucinated tool names → correct tool names */
+const TOOL_ALIASES: Record<string, string> = {
+  "writeFile": "write_file",
+  "readFile": "read_file",
+  "editFile": "edit_file",
+  "createFile": "write_file",
+  "createDirectory": "create_directory",
+  "mkdir": "create_directory",
+  "listDirectory": "list_directory",
+  "listDir": "list_directory",
+  "ls": "list_directory",
+  "searchCode": "search_code",
+  "searchFiles": "search_files",
+  "runCommand": "run_command",
+  "exec": "run_command",
+  "shell": "run_command",
+  "moveFile": "move_file",
+  "deleteFile": "delete_file",
+  "removeFile": "delete_file",
+  "rm": "delete_file",
+  "webSearch": "web_search",
+  "search": "web_search",
+  "batchRead": "batch_read",
+  "batchWrite": "batch_write",
+  "batch_create": "batch_write",
+  "create_files": "batch_write",
+  "write_files": "batch_write",
+  "multi_write": "batch_write",
+}
+
+function sanitizeToolName(tool: string): string {
+  if (VALID_TOOLS.has(tool)) return tool
+
+  // Check aliases
+  const alias = TOOL_ALIASES[tool]
+  if (alias) {
+    console.log(`[sanitizer] Mapped hallucinated tool "${tool}" → "${alias}"`)
+    return alias
+  }
+
+  // Fuzzy match: try snake_case conversion
+  const snakeCase = tool.replace(/([A-Z])/g, "_$1").toLowerCase().replace(/^_/, "")
+  if (VALID_TOOLS.has(snakeCase)) {
+    console.log(`[sanitizer] Mapped camelCase tool "${tool}" → "${snakeCase}"`)
+    return snakeCase
+  }
+
+  // Last resort: log warning and return as-is (executor will handle the error)
+  console.warn(`[sanitizer] Unknown tool name: "${tool}" — no mapping found`)
+  return tool
+}
+
 // ─── Rate Limit Tracker (shared across all providers) ───
 
 export interface RateLimitState {
@@ -405,6 +466,21 @@ export abstract class BaseProvider {
       }
     }
 
+    // ─── Tool name sanitizer: fix hallucinated tool names ───
+    if (normalized.kind === "needs_tool") {
+      if (normalized.tool) {
+        normalized.tool = sanitizeToolName(normalized.tool)
+      }
+      if (normalized.tools) {
+        for (const tc of normalized.tools) {
+          tc.tool = sanitizeToolName(tc.tool)
+        }
+        // Update backwards-compat fields
+        normalized.tool = normalized.tools[0].tool
+        normalized.args = normalized.tools[0].args
+      }
+    }
+
     // Handle step transitions
     if (json.stepTransition) {
       normalized.stepTransition = json.stepTransition as { complete?: string; start?: string }
@@ -577,6 +653,27 @@ PARALLEL TOOL RULES:
 - When searching: batch multiple search_code/search_files calls together
 - The ONLY reason to use sequential single tools is when one depends on another's result
 
+⚠️ MAXIMIZE PARALLELISM — NEVER do sequential reads or edits when they can be batched:
+
+WRONG (slow — 5 sequential calls):
+  1. read_file app.module.ts
+  2. read_file main.ts
+  3. read_file .env
+  4. edit_file app.module.ts
+  5. edit_file main.ts
+
+RIGHT (fast — 2 parallel batches):
+  Batch 1: tools: [read_file app.module.ts, read_file main.ts, read_file .env]
+  Batch 2: tools: [edit_file app.module.ts, edit_file main.ts, edit_file .env]
+
+RULES:
+- If you need to read 2+ files → batch ALL reads into one "tools" array
+- If you need to edit 2+ files → batch ALL edits into one "tools" array
+- If you need to read THEN edit: batch reads first, then batch edits second
+- If you need to create new files (no read needed) → batch ALL write_file calls together
+- NEVER send a single read_file or edit_file when you could batch it with other independent operations
+- Use batch_read instead of multiple read_file calls when you just need content (faster)
+
 ═══ AVAILABLE TOOLS ═══
 
 1. list_directory — List files and folders
@@ -621,6 +718,7 @@ PARALLEL TOOL RULES:
 
 ═══ TOOL RULES ═══
 
+- There is NO "batch_write" tool. To write multiple files, use the "tools" array with multiple write_file entries.
 - All paths are relative to the project root. NEVER use "sysbase/" in any path.
 - For write_file: args MUST include "path" and "content". Content must be the FULL file source code.
 - For edit_file: args MUST include "path" and "patch". Patch must be the FULL new file content.
