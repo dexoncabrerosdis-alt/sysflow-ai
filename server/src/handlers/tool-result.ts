@@ -10,7 +10,12 @@ import { saveContext } from "../store/context.js"
 import { loadRunContext } from "../services/context.js"
 import { callModelAdapter } from "../providers/adapter.js"
 import { mapNormalizedResponseToClient } from "../providers/normalize.js"
-import type { ClientResponse } from "../types.js"
+import { validateCompletion, buildRejectionPayload, analyzeTaskComplexity } from "../services/completion-guard.js"
+import type { ClientResponse, NormalizedResponse } from "../types.js"
+
+/** Track how many times completion was rejected per run (prevent infinite loops) */
+const completionRejections = new Map<string, number>()
+const MAX_COMPLETION_REJECTIONS = 3
 
 interface ToolResultBody {
   runId: string
@@ -87,7 +92,7 @@ export async function handleToolResult(body: ToolResultBody): Promise<ClientResp
     }
   }
 
-  const normalized = await callModelAdapter(providerPayload as never)
+  let normalized = await callModelAdapter(providerPayload as never)
 
   await persistModelUsage({
     runId: body.runId,
@@ -96,6 +101,49 @@ export async function handleToolResult(body: ToolResultBody): Promise<ClientResp
     usage: normalized.usage,
     userId: run.userId || null
   })
+
+  // ─── COMPLETION GUARD: reject premature completion ───
+  if (normalized.kind === "completed") {
+    const rejectionCount = completionRejections.get(body.runId) || 0
+
+    if (rejectionCount < MAX_COMPLETION_REJECTIONS) {
+      const verdict = validateCompletion(body.runId, run.content)
+
+      if (!verdict.pass) {
+        completionRejections.set(body.runId, rejectionCount + 1)
+        console.log(`[completion-guard] REJECTED completion for run ${body.runId} (attempt ${rejectionCount + 1}/${MAX_COMPLETION_REJECTIONS}): ${verdict.reason?.slice(0, 150)}`)
+
+        // Send rejection back to the AI as a tool result — force it to continue
+        const rejection = buildRejectionPayload(verdict.reason!, run.content)
+        const retryPayload = {
+          ...providerPayload,
+          toolResult: { tool: rejection.tool, result: rejection.result },
+          toolResults: undefined
+        }
+
+        const retryNormalized = await callModelAdapter(retryPayload as never)
+        await persistModelUsage({
+          runId: body.runId,
+          projectId: run.projectId,
+          model: run.model,
+          usage: retryNormalized.usage,
+          userId: run.userId || null
+        })
+
+        // If AI STILL says completed after rejection, let it through on subsequent attempts
+        // (prevents infinite loops — after MAX_COMPLETION_REJECTIONS, we accept)
+        normalized = retryNormalized
+      }
+    } else {
+      // Max rejections reached — accept completion and clean up
+      completionRejections.delete(body.runId)
+    }
+  }
+
+  // Clean up rejection counter on terminal states
+  if (normalized.kind === "completed" || normalized.kind === "failed") {
+    completionRejections.delete(body.runId)
+  }
 
   // Handle step transitions
   if (normalized.stepTransition && task) {
