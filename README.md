@@ -122,6 +122,7 @@ CLI executes that action locally
 Result is sent back
       ↓
 Loop continues until the task is complete
+```
 
 The key idea is simple:
 
@@ -307,4 +308,4 @@ Build faster. Stay in control. Ship with confidence.
 
 Sysflow — AI execution for developers who still want the last word.
 
-</div> ```
+</div> 
