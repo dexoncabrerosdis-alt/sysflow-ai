@@ -21,7 +21,8 @@ import { createPipelineFromAiPlan, createFallbackPipeline, pipelineToTaskMeta } 
 import { detectScaffoldingNeed, buildScaffoldConfirmationMessage } from "../scaffold/index.js"
 import { estimateTokens, shouldBlockOnTokens } from "../services/context-budget.js"
 import { runReasoning, getReasonerBackendForRun } from "../reasoning/task-reasoner.js"
-import { classifyIntent, classifyIntentSmart } from "../reasoning/intent-classifier.js"
+import { classifyIntent, classifyIntentSmart, type ClassifyIntentSmartResult } from "../reasoning/intent-classifier.js"
+import { setIntentForRun } from "../services/intent-cache.js"
 import { recommendScaffold, resolveCommand, getInstallCommand } from "../scaffold/index.js"
 import { recordImplementSummary, recordOriginalIntent, recordDecision, recordBugPattern, applyMemoryFeedback } from "../memory-store/index.js"
 import { runReasoningChain } from "../reasoning/chain.js"
@@ -281,62 +282,118 @@ export async function handleUserMessage(body: UserMessageBody): Promise<ClientRe
     } as ClientResponse
   }
 
-  // ─── PHASE A (Stage 1 parallelization): 3 independent upfront Flash calls ─
-  //     project-init, preflight reasoning, and intent classification have
-  //     NO dependencies between them. Pre-Stage-1 they ran sequentially —
-  //     wall-clock = sum of all three latencies. Running in parallel cuts
-  //     to wall-clock = MAX of the three. On free-tier models where each
-  //     call is ~3-8s, this is roughly a 60-70% latency reduction on the
-  //     upfront block alone.
+  // ─── Stage 2 (Plan: speed-overhaul, 2026-05-19): skip-when-simple gate
+  //     BEFORE Phase A. The reactive-reasoning vision: fast by default,
+  //     reason ONLY when needed. For prompts the cheap regex already
+  //     classifies as "simple" — continuation phrases ("yes", "continue"),
+  //     bare shell-style requests ("ls", "what's here"), tldr/tour
+  //     requests, single-action utterances — there's no value in firing
+  //     project-init, preflight, OR the LLM intent chain. Each costs a
+  //     Flash call (and Flash budget pressure was the bottleneck on
+  //     free-tier OpenRouter + Anthropic personal-tier accounts).
   //
-  //     Error isolation: each promise's `.catch` returns null (or the
-  //     classifier's regex fallback) so a single failure doesn't poison
-  //     the others. Side effects (setRepoState, seedLedger,
-  //     intent-classifier log) apply AFTER the await so the order of
-  //     observable state mutations matches pre-Stage-1 behaviour.
+  //     Result: simple prompts now reach the main agent loop with ZERO
+  //     upfront Flash calls. Non-simple prompts still go through Stage
+  //     1's parallel Phase A (3 calls in parallel).
   //
   //     Source: plan `.claude/plans/2026-05-18-reasoning-speed-and-rate-limit-overhaul.md`.
-  const projectInitEnabled = (() => {
-    try { return getFlag<boolean>("quality.project_init_reasoning_enabled", body.sysbasePath as string | undefined) }
+  const fastIntentRegexEnabled = (() => {
+    try { return getFlag<boolean>("reasoning.intent_classification_fast_path_regex_enabled") }
     catch { return true }
   })()
-  const projectInitMaxIters = projectInitEnabled
-    ? (() => {
-        try { return getFlag<number>("reasoning.project_init_max_iterations", body.sysbasePath as string | undefined) }
-        catch { return 3 }
-      })()
-    : 3
+  const fastIntent = fastIntentRegexEnabled ? classifyIntent(body.content) : null
+  const skipUpfrontReasoning = fastIntent === "simple"
 
-  const [projectInitBrief, reasoningBriefRaw, intentResult] = await Promise.all([
-    projectInitEnabled
-      ? runProjectInitChain({
-          directoryTree: (body.directoryTree ?? []) as Array<{ name: string; type: "file" | "directory" }>,
-          userMessage: body.content,
-          platform: clientPlatform,
-          model: body.model,
-          maxIterations: projectInitMaxIters,
-        }).catch((err: unknown) => {
-          console.warn(`[project-init] chain threw:`, (err as Error).message)
-          return null
-        })
-      : Promise.resolve(null),
-    runReasoning({
-      trigger: "preflight",
-      userMessage: body.content,
-      model: body.model,
-      cwd: body.cwd,
-      sysbasePath: body.sysbasePath,
-      runId,
-    }).catch((err: unknown) => {
-      console.warn(`[reasoning] preflight failed:`, (err as Error).message)
-      return null
-    }),
-    classifyIntentSmart({
-      userMessage: body.content,
-      runId,
-      model: body.model,
-    }),
-  ])
+  // Loose typing: matches the original `let reasoningBrief: unknown = null`
+  // shape. Downstream call sites already use property-access casts to
+  // narrow the brief, so an `any`-typed local doesn't lose any safety
+  // versus the pre-Stage-2 code.
+  let projectInitBrief: import("../reasoning/project-init-reasoner.js").ProjectInitBrief | null
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let reasoningBriefRaw: any
+  let intentResult: ClassifyIntentSmartResult
+
+  if (skipUpfrontReasoning) {
+    // Fast path: 0 Flash calls. Synthesize the same `intentResult`
+    // shape `classifyIntentSmart` would return on its regex_simple
+    // branch + cache the classification so `tool-result.ts`'s later
+    // `getCachedIntentOrRegex` calls see a stable intent without
+    // re-classifying.
+    console.log(`[user-message] fast-path: regex intent=simple, skipping all upfront reasoning Flash calls`)
+    setIntentForRun(runId, "simple")
+    intentResult = { hint: "simple", source: "regex_simple" }
+    // Synthesize the preflight stub envelope — mirrors what
+    // `runReasoning({ trigger: "preflight" })` returns when its
+    // pipeline picker resolves to "simple" (see task-reasoner.ts
+    // lines 131-141). Keeps downstream callers (scaffold-first
+    // recommender, ask_user check, Phase B gates) seeing the
+    // consistent shape they already expect for simple prompts.
+    reasoningBriefRaw = {
+      pipeline: "simple",
+      confidence: "HIGH",
+      decision: "proceed",
+      missingContext: [],
+    }
+    projectInitBrief = null
+  } else {
+    // ─── PHASE A (Stage 1 parallelization): 3 independent upfront Flash calls ─
+    //     project-init, preflight reasoning, and intent classification have
+    //     NO dependencies between them. Pre-Stage-1 they ran sequentially —
+    //     wall-clock = sum of all three latencies. Running in parallel cuts
+    //     to wall-clock = MAX of the three. On free-tier models where each
+    //     call is ~3-8s, this is roughly a 60-70% latency reduction on the
+    //     upfront block alone.
+    //
+    //     Error isolation: each promise's `.catch` returns null (or the
+    //     classifier's regex fallback) so a single failure doesn't poison
+    //     the others. Side effects (setRepoState, seedLedger,
+    //     intent-classifier log) apply AFTER the await so the order of
+    //     observable state mutations matches pre-Stage-1 behaviour.
+    const projectInitEnabled = (() => {
+      try { return getFlag<boolean>("quality.project_init_reasoning_enabled", body.sysbasePath as string | undefined) }
+      catch { return true }
+    })()
+    const projectInitMaxIters = projectInitEnabled
+      ? (() => {
+          try { return getFlag<number>("reasoning.project_init_max_iterations", body.sysbasePath as string | undefined) }
+          catch { return 3 }
+        })()
+      : 3
+
+    const phaseA = await Promise.all([
+      projectInitEnabled
+        ? runProjectInitChain({
+            directoryTree: (body.directoryTree ?? []) as Array<{ name: string; type: "file" | "directory" }>,
+            userMessage: body.content,
+            platform: clientPlatform,
+            model: body.model,
+            maxIterations: projectInitMaxIters,
+          }).catch((err: unknown) => {
+            console.warn(`[project-init] chain threw:`, (err as Error).message)
+            return null
+          })
+        : Promise.resolve(null),
+      runReasoning({
+        trigger: "preflight",
+        userMessage: body.content,
+        model: body.model,
+        cwd: body.cwd,
+        sysbasePath: body.sysbasePath,
+        runId,
+      }).catch((err: unknown) => {
+        console.warn(`[reasoning] preflight failed:`, (err as Error).message)
+        return null
+      }),
+      classifyIntentSmart({
+        userMessage: body.content,
+        runId,
+        model: body.model,
+      }),
+    ])
+    projectInitBrief = phaseA[0]
+    reasoningBriefRaw = phaseA[1]
+    intentResult = phaseA[2]
+  }
   const reasoningBrief: unknown = reasoningBriefRaw
 
   // ─── Apply project-init side effects ───
