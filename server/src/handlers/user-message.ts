@@ -191,77 +191,17 @@ export async function handleUserMessage(body: UserMessageBody): Promise<ClientRe
     ingestDirectoryTree(runId, body.directoryTree)
   }
 
-  // ─── Stage 1 of agent-runtime-fixes plan: project-init reasoning ───
-  // Fires BEFORE preflight. Classifies the working directory as
-  // empty / small / existing-small / existing-large and emits a
-  // tailored investigation plan + skip list for the action-planner.
-  // Closes the user-reported failure mode where the agent demanded
-  // tsconfig.json in an empty directory and hard-stopped on a 0-hit
-  // web search. Best-effort; failures degrade gracefully (chain
-  // returns null → action-planner's pre-Stage-1 behaviour stays).
-  let projectInitBrief: import("../reasoning/project-init-reasoner.js").ProjectInitBrief | null = null
-  const projectInitEnabled = (() => {
-    try { return getFlag<boolean>("quality.project_init_reasoning_enabled", body.sysbasePath as string | undefined) }
-    catch { return true }
-  })()
-  if (projectInitEnabled) {
-    try {
-      const maxIters = (() => {
-        try { return getFlag<number>("reasoning.project_init_max_iterations", body.sysbasePath as string | undefined) }
-        catch { return 3 }
-      })()
-      projectInitBrief = await runProjectInitChain({
-        directoryTree: (body.directoryTree ?? []) as Array<{ name: string; type: "file" | "directory" }>,
-        userMessage: body.content,
-        // Stage 4.1: use the user's platform so the reasoner's
-        // suggestions (preferred commands, scaffolding tools) match
-        // what the user's machine can actually run.
-        platform: clientPlatform,
-        model: body.model,
-        maxIterations: maxIters,
-      })
-      if (projectInitBrief) {
-        console.log(`[project-init] committed: repoState=${projectInitBrief.repoState} fileCount=${projectInitBrief.fileCount} confidence=${projectInitBrief.confidence} iterations=${projectInitBrief.iterations}`)
-        // Stage 3 of accountability-and-parallel-execution-sequencing
-        // plan: persist the repoState classification so tool_result.ts
-        // can gate the read-after-write inject on later turns (the cli
-        // only sends the brief on the initial turn). HIGH/MEDIUM
-        // confidence is enough to commit; LOW confidence still stores
-        // (the inject is a soft nudge, false-positives are low-cost).
-        setRepoState(runId, projectInitBrief.repoState)
-        // Seed the action-planner skip list ONLY when the brief is
-        // confident enough to commit. LOW-confidence empty/small reads
-        // could be a misclassification on a monorepo root; let the
-        // hijack still fire as a safety net.
-        if (
-          (projectInitBrief.repoState === "empty" || projectInitBrief.repoState === "small") &&
-          projectInitBrief.confidence !== "LOW" &&
-          projectInitBrief.skipConfigVerificationFor.length > 0
-        ) {
-          setConfigSkipList(runId, projectInitBrief.skipConfigVerificationFor)
-          console.log(`[project-init] seeded action-planner skip list (${projectInitBrief.skipConfigVerificationFor.length} entries)`)
-        }
-        // Stage 4 follow-up of agent-code-correctness plan: seed the
-        // completion-artifact gate's per-run list from the brief's
-        // expectedArtifacts. The LLM decides which artifacts are
-        // required; the gate enforces against the disk at completion
-        // time. Confidence-aware: LOW-confidence verdicts don't seed
-        // (gate falls back to hardcoded keyword classifier as safety
-        // net). Always set (even empty list) so the gate knows the
-        // LLM ran and decided — empty list = no artifacts required,
-        // skip enforcement.
-        if (projectInitBrief.confidence !== "LOW") {
-          setExpectedArtifacts(runId, projectInitBrief.expectedArtifacts)
-          if (projectInitBrief.expectedArtifacts.length > 0) {
-            console.log(`[project-init] LLM committed expectedArtifacts: ${projectInitBrief.expectedArtifacts.join(", ")}`)
-          }
-        }
-      }
-    } catch (err) {
-      console.warn(`[project-init] chain threw:`, (err as Error).message)
-    }
-  }
-
+  // ─── Cheap synchronous early-returns FIRST (Plan
+  //     2026-05-18-reasoning-speed-and-rate-limit-overhaul.md Stage 1):
+  //     scaffold-confirmation, frontend-pattern injection, error-aware
+  //     fix path, and the pre-API token guard all short-circuit BEFORE
+  //     we pay for any Flash call. Pre-Stage-1 these ran AFTER
+  //     project-init's await — meaning a prompt that early-returned on
+  //     scaffold-options still paid for the project-init Flash call
+  //     just to discard the brief.
+  //
+  //     These checks are pure-sync on user input + dirTree; none depend
+  //     on the reasoning briefs that follow. Moving them up is safe.
   // ─── Deprecate stale context entries (cheap, runs once per new prompt) ───
   deprecateStaleEntries(body.projectId, 30).catch(() => { /* non-blocking */ })
 
@@ -269,8 +209,6 @@ export async function handleUserMessage(body: UserMessageBody): Promise<ClientRe
   const scaffoldOptions = detectScaffoldingNeed(body.content, body.directoryTree || [])
   if (scaffoldOptions) {
     console.log(`[scaffold] Detected new project — presenting ${scaffoldOptions.length} scaffolding options to user`)
-
-    // Scaffold confirmation — pipeline created later when AI responds with its plan
     return {
       status: "waiting_for_user",
       runId,
@@ -297,10 +235,8 @@ export async function handleUserMessage(body: UserMessageBody): Promise<ClientRe
     console.log(`[error-aware] Detected fixable error: "${ctx.description}" — searching for "${baseName}" first`)
     setPendingError(runId, ctx)
 
-    // Detect ALL errors from the prompt and queue remaining ones for sequential fixing
     const allErrors = detectAllErrors(body.content)
     if (allErrors.length > 1) {
-      // Queue all errors except the first (which we're handling now)
       const remaining = allErrors.filter(e => !(e.sourceFile === ctx.sourceFile && e.targetImport === ctx.targetImport))
       if (remaining.length > 0) {
         setPendingErrorQueue(runId, remaining)
@@ -308,13 +244,11 @@ export async function handleUserMessage(body: UserMessageBody): Promise<ClientRe
       }
     }
 
-    // Pass all detected errors to the pipeline for specific step labels
     const allErrorsForPipeline = allErrors.length > 0
       ? allErrors.map(e => ({ sourceFile: e.sourceFile, targetImport: e.targetImport }))
       : [{ sourceFile: ctx.sourceFile, targetImport: ctx.targetImport }]
     const pipeline = createFallbackPipeline(runId, body.content, allErrorsForPipeline)
 
-    // Always search first — never guess the extension
     const searchAction: NormalizedResponse = {
       kind: "needs_tool",
       tool: "search_files",
@@ -328,262 +262,7 @@ export async function handleUserMessage(body: UserMessageBody): Promise<ClientRe
     return mapNormalizedResponseToClient(runId, searchAction)
   }
 
-  // ─── Phase 5 pre-flight reasoning: classify task, recommend stack, surface missing context ───
-  let reasoningBrief: unknown = null
-  try {
-    const briefResult = await runReasoning({
-      trigger: "preflight",
-      userMessage: body.content,
-      model: body.model,
-      cwd: body.cwd,
-      sysbasePath: body.sysbasePath,
-      runId,
-    })
-    reasoningBrief = briefResult
-    // Stage 2 of free-tier quality enforcement: seed the persistent task
-    // ledger from the preflight implement brief's buildPlan. Fires for
-    // any implement brief (not gated on confidence — even a LOW-confidence
-    // run still benefits from having "what subtasks remain" anchored in
-    // the system prompt, so the agent can't lose track of the original
-    // ask mid-run).
-    if (briefResult && briefResult.pipeline === "implement" && briefResult.implementBrief) {
-      const buildPlan = briefResult.implementBrief.buildPlan ?? []
-      if (Array.isArray(buildPlan) && buildPlan.length > 0) {
-        seedLedgerFromBuildPlan(runId, buildPlan)
-      }
-    }
-    // Phase 8 + 15 Stage 1: persist preflight brief by pipeline kind.
-    // Each branch self-gates on confidence + decision so a LOW-confidence
-    // run doesn't ossify a guess. The recorder also has its own internal
-    // LOW guard for `recordDecision`, so this is belt-and-suspenders.
-    if (briefResult && briefResult.decision === "proceed" && briefResult.confidence !== "LOW") {
-      if (briefResult.pipeline === "implement" && briefResult.implementBrief) {
-        recordImplementSummary(
-          body.cwd,
-          { implementBrief: briefResult.implementBrief, confidence: briefResult.confidence },
-          { runId, trigger: "preflight" },
-        ).catch(() => { /* best-effort */ })
-      } else if (briefResult.pipeline === "bug" && briefResult.bugBrief) {
-        // Bug brief at preflight is rare (most bug reasoning fires on_error)
-        // but happens when the user's prompt itself describes a bug. Record
-        // the diagnosis so the next time the same symptom is reported it
-        // surfaces from memory.
-        const bb = briefResult.bugBrief
-        const summary = [
-          `Symptom: ${bb.symptom}`,
-          `Boundary: ${bb.suspectedBoundary}`,
-          bb.rootCauseGuess ? `Root cause: ${bb.rootCauseGuess}` : null,
-          bb.proposedFix?.description ? `Fix: ${bb.proposedFix.description} (scope: ${bb.proposedFix.scope ?? "?"})` : null,
-        ].filter(Boolean).join("\n")
-        recordBugPattern(
-          body.cwd,
-          summary,
-          bb.proposedFix?.filesAffected,
-          { runId, trigger: "preflight" },
-          { confidence: briefResult.confidence },
-        ).catch(() => { /* best-effort */ })
-      } else if (briefResult.pipeline === "decision" && briefResult.decisionBrief) {
-        // Preflight rarely classifies as `decision` (the routing prefers
-        // implement/bug/summary), but when it does — typically when the
-        // user prompt is a stack/architecture question — record it so the
-        // next similar question doesn't re-deliberate from scratch.
-        recordDecision(
-          body.cwd,
-          { decisionBrief: briefResult.decisionBrief, confidence: briefResult.confidence },
-          { runId, trigger: "preflight" },
-        ).catch(() => { /* best-effort */ })
-      }
-    }
-    // If the reasoner says ask_user, short-circuit immediately with the consolidated questions.
-    if (briefResult && briefResult.pipeline !== "simple" && briefResult.decision === "ask_user" && briefResult.missingContext.length > 0) {
-      const lines: string[] = []
-      lines.push(`Before I start, I need a few things to avoid guessing:`)
-      lines.push("")
-      for (const m of briefResult.missingContext) {
-        lines.push(`• **${m.field}** — ${m.suggestedQuestion}` + (m.exampleValue ? `\n   _e.g._ \`${m.exampleValue}\`` : ""))
-      }
-      lines.push("")
-      if (briefResult.pipeline === "implement" && briefResult.implementBrief) {
-        lines.push(`I'm planning to use **${briefResult.implementBrief.recommendedStack.language}**` +
-          (briefResult.implementBrief.recommendedStack.frameworks.length ? ` + ${briefResult.implementBrief.recommendedStack.frameworks.join(" + ")}` : "") +
-          ` — ${briefResult.implementBrief.recommendedStack.rationale}`)
-      } else if (briefResult.pipeline === "bug" && briefResult.bugBrief) {
-        lines.push(`I suspect a **${briefResult.bugBrief.suspectedBoundary}** issue — paste the requested context and I'll narrow it down.`)
-      }
-      console.log(`[reasoning] preflight ask_user with ${briefResult.missingContext.length} questions`)
-      return {
-        status: "waiting_for_user",
-        runId,
-        message: lines.join("\n"),
-        reasoningBrief: briefResult,
-      } as ClientResponse
-    }
-  } catch (err) {
-    console.warn(`[reasoning] preflight failed:`, (err as Error).message)
-  }
-
-  // ─── Phase 16 Stage 3: chained preflight elaboration (free-tier only) ───
-  // When the run uses a free-tier model AND the preflight returned
-  // implement with confidence < HIGH AND the task complexity is medium
-  // or complex, fire a second-stage `implement_elaborate` Flash. The
-  // gate is computed pure-function-style in free-tier-policy.ts; here we
-  // just consult it. Output is plumbed into the main model's prompt
-  // alongside the original implement brief — the model sees both the
-  // surface brief AND the elaboration's "whyThisApproach / preconditions"
-  // reasoning. Best-effort: a chain failure leaves reasoningElaborationBrief
-  // null and the run continues with the preflight brief alone (today's
-  // behaviour).
-  let reasoningElaborationBrief: unknown = null
-  const briefAsEnv = reasoningBrief as { pipeline?: string; confidence?: "HIGH" | "MEDIUM" | "LOW"; decision?: string } | null
-  if (
-    briefAsEnv
-    && briefAsEnv.pipeline === "implement"
-    && briefAsEnv.decision === "proceed"
-    && shouldRunPreflightElaboration({
-      model: body.model,
-      complexity: taskComplexity.complexity,
-      preflightConfidence: briefAsEnv.confidence ?? null,
-      flagEnabled: ((): boolean => {
-        try { return getFlag<boolean>("reasoning.chained.preflight_elaboration_enabled", body.sysbasePath) }
-        catch { return true }
-      })(),
-    })
-  ) {
-    try {
-      const chain = await runReasoningChain(
-        {
-          trigger: "preflight",
-          userMessage: body.content,
-          model: body.model,
-          cwd: body.cwd,
-          sysbasePath: body.sysbasePath,
-        },
-        [
-          {
-            name: "implement_elaborate",
-            buildPayload: (_prior, original) => ({
-              ...original,
-              trigger: "implement_elaborate" as const,
-              context: {
-                preflightBrief: reasoningBrief,
-                taskComplexity: taskComplexity.complexity,
-              },
-            }),
-          },
-        ],
-      )
-      if (chain.finalBrief && chain.finalBrief.pipeline === "implement_elaborate") {
-        reasoningElaborationBrief = chain.finalBrief
-        const elabBrief = (chain.finalBrief as { implementElaborationBrief?: { confidence?: string } }).implementElaborationBrief
-        console.log(`[reasoning] preflight elaboration: confidence=${elabBrief?.confidence ?? "?"} (${chain.stages.length} stages)`)
-      }
-    } catch (err) {
-      console.warn(`[reasoning] preflight elaboration failed:`, (err as Error).message)
-    }
-  }
-
-  // ─── Phase 10: chunked reasoning loop — first chunk-plan call.
-  //
-  // After preflight, when the implement intent is in play AND the chunked
-  // loop is enabled, fire the FIRST chunk-plan call. The planner picks the
-  // 1-5 files for the first chunk based on the implement brief; the result
-  // gets stashed on the response (Stage 4 will inject it into the model
-  // prompt so the main model honours the planner's file list).
-  //
-  // 2026-05-18 (Plan 4 Stage 3): trivial-task threshold tightened from
-  // ≤3 to ≤1 steps. The pre-Stage-3 threshold blocked the chunked-loop
-  // for buildPlans like ["create package.json", "set up Express",
-  // "configure Postgres"] — 3 high-level bullets that expand to 15-25
-  // actual files at execution time. Real "trivial" is a single-step
-  // plan ("rename function in one file"); 2-3 steps deserve chunked
-  // structure for the file ordering + reflector verification.
-  let chunkPlanBrief: ChunkPlanBrief | null = null
-  try {
-    const chunkedLoopOn = getFlag<boolean>("reasoning.chunked_loop_enabled", body.sysbasePath)
-    const briefPipeline = (reasoningBrief as { pipeline?: string } | null)?.pipeline
-    const implementBrief = (reasoningBrief as { implementBrief?: { buildPlan?: unknown[] } } | null)?.implementBrief
-    const buildPlanSteps = Array.isArray(implementBrief?.buildPlan) ? implementBrief!.buildPlan!.length : 0
-    const isTrivial = buildPlanSteps === 1
-
-    if (chunkedLoopOn && briefPipeline === "implement" && !isTrivial) {
-      const planResult = await runReasoning({
-        trigger: "chunk_plan",
-        userMessage: body.content,
-        model: body.model,
-        cwd: body.cwd,
-        sysbasePath: body.sysbasePath,
-        runId,
-        context: {
-          originalUserPrompt: body.content,
-          implementBrief: implementBrief ?? null,
-          chunkHistory: [],
-        },
-      })
-      if (planResult?.chunkPlanBrief) {
-        chunkPlanBrief = planResult.chunkPlanBrief
-        // Phase 16 Stage 5: tighten the planner's file list to the
-        // free-tier cap. Schema allows up to 5; free-tier drops to 4 so
-        // the free model has fewer balls in the air per chunk. Paid-tier
-        // passes through at 5 (slice is a no-op).
-        const maxFiles = resolveMaxFilesPerChunk(body.model)
-        if (chunkPlanBrief.files.length > maxFiles) {
-          chunkPlanBrief.files = chunkPlanBrief.files.slice(0, maxFiles)
-        }
-        // Initialise executedFiles with the planner's intent. Stage 4 will
-        // refine this once the main model actually executes the chunk.
-        recordChunkStart(runId, chunkPlanBrief, [...chunkPlanBrief.files])
-        console.log(`[chunked-loop] chunk 0 planned: ${chunkPlanBrief.nextAction} (${chunkPlanBrief.files.length} files, cap=${maxFiles})`)
-      }
-    }
-  } catch (err) {
-    console.warn(`[chunked-loop] initial chunk_plan failed:`, (err as Error).message)
-  }
-
-  // ─── Phase 6 scaffold-first: when reasoning is HIGH confidence on a known stack and cwd is empty,
-  // skip the model call entirely and emit the scaffolder run_command directly. ───
-  try {
-    const briefAny = reasoningBrief as never as Parameters<typeof recommendScaffold>[0]["brief"]
-    const recommendation = recommendScaffold({
-      brief: briefAny,
-      userMessage: body.content,
-      cwd: body.cwd,
-      directoryTree: body.directoryTree as never,
-    })
-    if (recommendation.shouldScaffold && recommendation.autoTrust && recommendation.scaffolder) {
-      const scaffoldCmd = resolveCommand(recommendation.scaffolder, recommendation.projectName)
-      const installCmd = getInstallCommand(recommendation.scaffolder, recommendation.projectName)
-      console.log(`[scaffold-first] auto-trust ${recommendation.scaffolder.stackKey}: ${scaffoldCmd} (note: simple stacks like Vite-family have autoTrust=false and fall through to hand-writing)`)
-
-      // Inject post-scaffold guidance so the agent knows what to do after the command returns.
-      const postScaffoldNote = recommendation.scaffolder.postScaffoldNote
-      const followUpLines: string[] = []
-      followUpLines.push(`[SCAFFOLD COMPLETE] You scaffolded "${recommendation.projectName}" using ${recommendation.scaffolder.displayName}.`)
-      followUpLines.push(`The scaffolder created the standard file layout — DO NOT recreate files it already produced. Read package.json first to see what's there.`)
-      if (installCmd) {
-        followUpLines.push(`Next: run \`${installCmd}\` to install deps. The permission system will ask the user once.`)
-      }
-      if (postScaffoldNote) followUpLines.push(`NOTE: ${postScaffoldNote}`)
-      followUpLines.push(`Then customise the scaffold for the user's actual task: "${body.content}".`)
-      actionPlanner.injectContext(runId, followUpLines.join("\n"))
-
-      // Synthesize the scaffold action as the agent's first response.
-      const synthesizedNormalized: NormalizedResponse = {
-        kind: "needs_tool",
-        tool: "run_command",
-        args: { command: scaffoldCmd, cwd: "." },
-        content: `Scaffolding ${recommendation.scaffolder.displayName} into ./${recommendation.projectName}`,
-        reasoning: `HIGH-confidence single registry match for ${recommendation.scaffolder.stackKey}; running the scaffolder beats hand-writing config files.`,
-        usage: { inputTokens: 0, outputTokens: 0 },
-      }
-      const clientResp = mapNormalizedResponseToClient(runId, synthesizedNormalized)
-      clientResp.reasoningBrief = reasoningBrief
-      return clientResp
-    }
-  } catch (err) {
-    console.warn(`[scaffold-first] recommender failed:`, (err as Error).message)
-  }
-
-  // ─── Pre-API token guard: refuse oversized payloads instead of wasting an API call ───
+  // ─── Pre-API token guard: refuse oversized payloads BEFORE Flash calls ───
   const estimatedTokens =
     estimateTokens(body.content) +
     estimateTokens(body.directoryTree) +
@@ -602,26 +281,303 @@ export async function handleUserMessage(body: UserMessageBody): Promise<ClientRe
     } as ClientResponse
   }
 
-  // Phase 18 Stage 5: surface the run's classified intent + complexity
-  // on the provider payload so the system-rules section can conditionally
-  // emit the taskPlan instruction (and the normalizer can defensively
-  // drop a stray taskPlan if a free-tier model emits one anyway).
-  // `taskComplexity` was already computed earlier in this handler (line ~60)
-  // for logging — reuse `taskComplexity.complexity` directly.
+  // ─── PHASE A (Stage 1 parallelization): 3 independent upfront Flash calls ─
+  //     project-init, preflight reasoning, and intent classification have
+  //     NO dependencies between them. Pre-Stage-1 they ran sequentially —
+  //     wall-clock = sum of all three latencies. Running in parallel cuts
+  //     to wall-clock = MAX of the three. On free-tier models where each
+  //     call is ~3-8s, this is roughly a 60-70% latency reduction on the
+  //     upfront block alone.
   //
-  // Stage 4 of plan 2026-05-15-llm-iterative-intent-classification.md:
-  // Use the smart classifier. First turn of a run goes through the LLM
-  // iterative chain (when enabled); the per-run cache caps total
-  // intent-classification cost to ~1 call per run. tool-result.ts
-  // reads from the cache on subsequent turns.
-  const intentResult = await classifyIntentSmart({
-    userMessage: body.content,
-    runId,
-    model: body.model,
-  })
+  //     Error isolation: each promise's `.catch` returns null (or the
+  //     classifier's regex fallback) so a single failure doesn't poison
+  //     the others. Side effects (setRepoState, seedLedger,
+  //     intent-classifier log) apply AFTER the await so the order of
+  //     observable state mutations matches pre-Stage-1 behaviour.
+  //
+  //     Source: plan `.claude/plans/2026-05-18-reasoning-speed-and-rate-limit-overhaul.md`.
+  const projectInitEnabled = (() => {
+    try { return getFlag<boolean>("quality.project_init_reasoning_enabled", body.sysbasePath as string | undefined) }
+    catch { return true }
+  })()
+  const projectInitMaxIters = projectInitEnabled
+    ? (() => {
+        try { return getFlag<number>("reasoning.project_init_max_iterations", body.sysbasePath as string | undefined) }
+        catch { return 3 }
+      })()
+    : 3
+
+  const [projectInitBrief, reasoningBriefRaw, intentResult] = await Promise.all([
+    projectInitEnabled
+      ? runProjectInitChain({
+          directoryTree: (body.directoryTree ?? []) as Array<{ name: string; type: "file" | "directory" }>,
+          userMessage: body.content,
+          platform: clientPlatform,
+          model: body.model,
+          maxIterations: projectInitMaxIters,
+        }).catch((err: unknown) => {
+          console.warn(`[project-init] chain threw:`, (err as Error).message)
+          return null
+        })
+      : Promise.resolve(null),
+    runReasoning({
+      trigger: "preflight",
+      userMessage: body.content,
+      model: body.model,
+      cwd: body.cwd,
+      sysbasePath: body.sysbasePath,
+      runId,
+    }).catch((err: unknown) => {
+      console.warn(`[reasoning] preflight failed:`, (err as Error).message)
+      return null
+    }),
+    classifyIntentSmart({
+      userMessage: body.content,
+      runId,
+      model: body.model,
+    }),
+  ])
+  const reasoningBrief: unknown = reasoningBriefRaw
+
+  // ─── Apply project-init side effects ───
+  if (projectInitBrief) {
+    console.log(`[project-init] committed: repoState=${projectInitBrief.repoState} fileCount=${projectInitBrief.fileCount} confidence=${projectInitBrief.confidence} iterations=${projectInitBrief.iterations}`)
+    setRepoState(runId, projectInitBrief.repoState)
+    if (
+      (projectInitBrief.repoState === "empty" || projectInitBrief.repoState === "small") &&
+      projectInitBrief.confidence !== "LOW" &&
+      projectInitBrief.skipConfigVerificationFor.length > 0
+    ) {
+      setConfigSkipList(runId, projectInitBrief.skipConfigVerificationFor)
+      console.log(`[project-init] seeded action-planner skip list (${projectInitBrief.skipConfigVerificationFor.length} entries)`)
+    }
+    if (projectInitBrief.confidence !== "LOW") {
+      setExpectedArtifacts(runId, projectInitBrief.expectedArtifacts)
+      if (projectInitBrief.expectedArtifacts.length > 0) {
+        console.log(`[project-init] LLM committed expectedArtifacts: ${projectInitBrief.expectedArtifacts.join(", ")}`)
+      }
+    }
+  }
+
+  // ─── Apply preflight side effects ───
+  if (reasoningBriefRaw && reasoningBriefRaw.pipeline === "implement" && reasoningBriefRaw.implementBrief) {
+    const buildPlan = reasoningBriefRaw.implementBrief.buildPlan ?? []
+    if (Array.isArray(buildPlan) && buildPlan.length > 0) {
+      seedLedgerFromBuildPlan(runId, buildPlan)
+    }
+  }
+  if (reasoningBriefRaw && reasoningBriefRaw.decision === "proceed" && reasoningBriefRaw.confidence !== "LOW") {
+    if (reasoningBriefRaw.pipeline === "implement" && reasoningBriefRaw.implementBrief) {
+      recordImplementSummary(
+        body.cwd,
+        { implementBrief: reasoningBriefRaw.implementBrief, confidence: reasoningBriefRaw.confidence },
+        { runId, trigger: "preflight" },
+      ).catch(() => { /* best-effort */ })
+    } else if (reasoningBriefRaw.pipeline === "bug" && reasoningBriefRaw.bugBrief) {
+      const bb = reasoningBriefRaw.bugBrief
+      const summary = [
+        `Symptom: ${bb.symptom}`,
+        `Boundary: ${bb.suspectedBoundary}`,
+        bb.rootCauseGuess ? `Root cause: ${bb.rootCauseGuess}` : null,
+        bb.proposedFix?.description ? `Fix: ${bb.proposedFix.description} (scope: ${bb.proposedFix.scope ?? "?"})` : null,
+      ].filter(Boolean).join("\n")
+      recordBugPattern(
+        body.cwd,
+        summary,
+        bb.proposedFix?.filesAffected,
+        { runId, trigger: "preflight" },
+        { confidence: reasoningBriefRaw.confidence },
+      ).catch(() => { /* best-effort */ })
+    } else if (reasoningBriefRaw.pipeline === "decision" && reasoningBriefRaw.decisionBrief) {
+      recordDecision(
+        body.cwd,
+        { decisionBrief: reasoningBriefRaw.decisionBrief, confidence: reasoningBriefRaw.confidence },
+        { runId, trigger: "preflight" },
+      ).catch(() => { /* best-effort */ })
+    }
+  }
+
+  // ─── Apply intent classifier side effects ───
   const runIntent = intentResult.hint
   if (intentResult.source !== "cache") {
     console.log(`[intent-classifier] run ${runId} → ${runIntent} (source: ${intentResult.source}${intentResult.paragraphs?.length ? `, ${intentResult.paragraphs.length} paragraph${intentResult.paragraphs.length === 1 ? "" : "s"}` : ""})`)
+  }
+
+  // ─── Preflight ask_user short-circuit (saves Phase B Flash calls) ───
+  if (reasoningBriefRaw && reasoningBriefRaw.pipeline !== "simple" && reasoningBriefRaw.decision === "ask_user" && reasoningBriefRaw.missingContext.length > 0) {
+    const lines: string[] = []
+    lines.push(`Before I start, I need a few things to avoid guessing:`)
+    lines.push("")
+    for (const m of reasoningBriefRaw.missingContext) {
+      lines.push(`• **${m.field}** — ${m.suggestedQuestion}` + (m.exampleValue ? `\n   _e.g._ \`${m.exampleValue}\`` : ""))
+    }
+    lines.push("")
+    if (reasoningBriefRaw.pipeline === "implement" && reasoningBriefRaw.implementBrief) {
+      lines.push(`I'm planning to use **${reasoningBriefRaw.implementBrief.recommendedStack.language}**` +
+        (reasoningBriefRaw.implementBrief.recommendedStack.frameworks.length ? ` + ${reasoningBriefRaw.implementBrief.recommendedStack.frameworks.join(" + ")}` : "") +
+        ` — ${reasoningBriefRaw.implementBrief.recommendedStack.rationale}`)
+    } else if (reasoningBriefRaw.pipeline === "bug" && reasoningBriefRaw.bugBrief) {
+      lines.push(`I suspect a **${reasoningBriefRaw.bugBrief.suspectedBoundary}** issue — paste the requested context and I'll narrow it down.`)
+    }
+    console.log(`[reasoning] preflight ask_user with ${reasoningBriefRaw.missingContext.length} questions`)
+    return {
+      status: "waiting_for_user",
+      runId,
+      message: lines.join("\n"),
+      reasoningBrief: reasoningBriefRaw,
+    } as ClientResponse
+  }
+
+  // ─── Phase 6 scaffold-first (moved up — saves Phase B Flash calls when
+  //     auto-trust matches). Only needs reasoningBrief, not the chunked-loop
+  //     planner or elaboration. ───
+  try {
+    const briefAny = reasoningBrief as never as Parameters<typeof recommendScaffold>[0]["brief"]
+    const recommendation = recommendScaffold({
+      brief: briefAny,
+      userMessage: body.content,
+      cwd: body.cwd,
+      directoryTree: body.directoryTree as never,
+    })
+    if (recommendation.shouldScaffold && recommendation.autoTrust && recommendation.scaffolder) {
+      const scaffoldCmd = resolveCommand(recommendation.scaffolder, recommendation.projectName)
+      const installCmd = getInstallCommand(recommendation.scaffolder, recommendation.projectName)
+      console.log(`[scaffold-first] auto-trust ${recommendation.scaffolder.stackKey}: ${scaffoldCmd} (note: simple stacks like Vite-family have autoTrust=false and fall through to hand-writing)`)
+
+      const postScaffoldNote = recommendation.scaffolder.postScaffoldNote
+      const followUpLines: string[] = []
+      followUpLines.push(`[SCAFFOLD COMPLETE] You scaffolded "${recommendation.projectName}" using ${recommendation.scaffolder.displayName}.`)
+      followUpLines.push(`The scaffolder created the standard file layout — DO NOT recreate files it already produced. Read package.json first to see what's there.`)
+      if (installCmd) {
+        followUpLines.push(`Next: run \`${installCmd}\` to install deps. The permission system will ask the user once.`)
+      }
+      if (postScaffoldNote) followUpLines.push(`NOTE: ${postScaffoldNote}`)
+      followUpLines.push(`Then customise the scaffold for the user's actual task: "${body.content}".`)
+      actionPlanner.injectContext(runId, followUpLines.join("\n"))
+
+      const synthesizedNormalized: NormalizedResponse = {
+        kind: "needs_tool",
+        tool: "run_command",
+        args: { command: scaffoldCmd, cwd: "." },
+        content: `Scaffolding ${recommendation.scaffolder.displayName} into ./${recommendation.projectName}`,
+        reasoning: `HIGH-confidence single registry match for ${recommendation.scaffolder.stackKey}; running the scaffolder beats hand-writing config files.`,
+        usage: { inputTokens: 0, outputTokens: 0 },
+      }
+      const clientResp = mapNormalizedResponseToClient(runId, synthesizedNormalized)
+      clientResp.reasoningBrief = reasoningBrief
+      return clientResp
+    }
+  } catch (err) {
+    console.warn(`[scaffold-first] recommender failed:`, (err as Error).message)
+  }
+
+  // ─── PHASE B (Stage 1 parallelization): 2 calls dependent on preflight ─
+  //     implement_elaborate and chunk_plan BOTH read from `reasoningBrief`
+  //     (the preflight output) but have NO dependency on each other. We
+  //     fire them in parallel: wall-clock = MAX(elab, chunkPlan) instead
+  //     of SUM.
+  //
+  //     Each is feature-gated (free-tier-only for elab; chunked-loop flag
+  //     + briefPipeline === "implement" + non-trivial buildPlan for
+  //     chunk_plan). Disabled paths resolve to Promise.resolve(null) so
+  //     the Promise.all return shape is stable.
+  const briefAsEnv = reasoningBrief as { pipeline?: string; confidence?: "HIGH" | "MEDIUM" | "LOW"; decision?: string } | null
+  const elaborationGateOn = (
+    !!briefAsEnv
+    && briefAsEnv.pipeline === "implement"
+    && briefAsEnv.decision === "proceed"
+    && shouldRunPreflightElaboration({
+      model: body.model,
+      complexity: taskComplexity.complexity,
+      preflightConfidence: briefAsEnv.confidence ?? null,
+      flagEnabled: ((): boolean => {
+        try { return getFlag<boolean>("reasoning.chained.preflight_elaboration_enabled", body.sysbasePath) }
+        catch { return true }
+      })(),
+    })
+  )
+  const chunkedLoopOn = (() => {
+    try { return getFlag<boolean>("reasoning.chunked_loop_enabled", body.sysbasePath) }
+    catch { return true }
+  })()
+  const chunkBriefPipeline = (reasoningBrief as { pipeline?: string } | null)?.pipeline
+  const implementBriefForChunk = (reasoningBrief as { implementBrief?: { buildPlan?: unknown[] } } | null)?.implementBrief
+  const buildPlanSteps = Array.isArray(implementBriefForChunk?.buildPlan) ? implementBriefForChunk!.buildPlan!.length : 0
+  // 2026-05-18 (Plan 4 Stage 3): trivial-task threshold tightened from
+  // ≤3 to ≤1 steps. Scaffold-class buildPlans summarize to 2-3 bullets
+  // that expand to 15-25 files at execution time; chunked-loop structure
+  // is valuable for those, not just for ≥4-bullet plans.
+  const isTrivial = buildPlanSteps === 1
+  const chunkPlanGateOn = chunkedLoopOn && chunkBriefPipeline === "implement" && !isTrivial
+
+  const [reasoningElaborationBrief, chunkPlanFromPlanner] = await Promise.all([
+    elaborationGateOn
+      ? runReasoningChain(
+          {
+            trigger: "preflight",
+            userMessage: body.content,
+            model: body.model,
+            cwd: body.cwd,
+            sysbasePath: body.sysbasePath,
+          },
+          [
+            {
+              name: "implement_elaborate",
+              buildPayload: (_prior, original) => ({
+                ...original,
+                trigger: "implement_elaborate" as const,
+                context: {
+                  preflightBrief: reasoningBrief,
+                  taskComplexity: taskComplexity.complexity,
+                },
+              }),
+            },
+          ],
+        ).then((chain) => {
+          if (chain.finalBrief && chain.finalBrief.pipeline === "implement_elaborate") {
+            const elabBrief = (chain.finalBrief as { implementElaborationBrief?: { confidence?: string } }).implementElaborationBrief
+            console.log(`[reasoning] preflight elaboration: confidence=${elabBrief?.confidence ?? "?"} (${chain.stages.length} stages)`)
+            return chain.finalBrief as unknown
+          }
+          return null
+        }).catch((err: unknown) => {
+          console.warn(`[reasoning] preflight elaboration failed:`, (err as Error).message)
+          return null as unknown
+        })
+      : Promise.resolve(null as unknown),
+    chunkPlanGateOn
+      ? runReasoning({
+          trigger: "chunk_plan",
+          userMessage: body.content,
+          model: body.model,
+          cwd: body.cwd,
+          sysbasePath: body.sysbasePath,
+          runId,
+          context: {
+            originalUserPrompt: body.content,
+            implementBrief: implementBriefForChunk ?? null,
+            chunkHistory: [],
+          },
+        }).then((planResult) => planResult?.chunkPlanBrief ?? null).catch((err: unknown) => {
+          console.warn(`[chunked-loop] initial chunk_plan failed:`, (err as Error).message)
+          return null
+        })
+      : Promise.resolve(null),
+  ])
+
+  // ─── Apply chunk-plan side effects ───
+  let chunkPlanBrief: ChunkPlanBrief | null = chunkPlanFromPlanner
+  if (chunkPlanBrief) {
+    // Phase 16 Stage 5: tighten the planner's file list to the
+    // free-tier cap. Schema allows up to 5; free-tier drops to 4 so
+    // the free model has fewer balls in the air per chunk. Paid-tier
+    // passes through at 5 (slice is a no-op).
+    const maxFiles = resolveMaxFilesPerChunk(body.model)
+    if (chunkPlanBrief.files.length > maxFiles) {
+      chunkPlanBrief.files = chunkPlanBrief.files.slice(0, maxFiles)
+    }
+    recordChunkStart(runId, chunkPlanBrief, [...chunkPlanBrief.files])
+    console.log(`[chunked-loop] chunk 0 planned: ${chunkPlanBrief.nextAction} (${chunkPlanBrief.files.length} files, cap=${maxFiles})`)
   }
 
   let normalized = await callModelAdapter({
