@@ -106,11 +106,17 @@ describe("classifyIntentSmart — regex fast-path for SIMPLE_PATTERNS", () => {
   })
 })
 
-describe("classifyIntentSmart — LLM chain (non-simple prompts)", () => {
-  it("runs the chain when the regex would say `implement`", async () => {
+describe("classifyIntentSmart — LLM chain (default-fallthrough prompts only)", () => {
+  // Stage 3 of speed-overhaul plan (2026-05-20): the LLM chain now
+  // fires ONLY when the regex fell through to the default "implement"
+  // verdict (no IMPLEMENT_LEAD / BUG / SUMMARY / SIMPLE pattern
+  // matched). Prompts that hit a specific pattern resolve as
+  // `regex_confident` and skip the chain entirely. The test prompts
+  // below use default-fallthrough phrasings so the chain still fires.
+  it("runs the chain for a default-fallthrough prompt (no specific pattern matched)", async () => {
     const stub: ClassifyIntentLlmCall = vi.fn().mockResolvedValueOnce(
       stepJson({
-        paragraph: "User asked to build a postgres-backed API — clear implement intent.",
+        paragraph: "Refactor task — implement-class change at scale.",
         done: true,
         hypothesis: "implement",
         confidence: "HIGH",
@@ -118,7 +124,10 @@ describe("classifyIntentSmart — LLM chain (non-simple prompts)", () => {
     )
 
     const out = await classifyIntentSmart(
-      { userMessage: "build a postgres-backed user API", runId: "r-llm-1" },
+      // No IMPLEMENT_LEAD anchor verb, no error keyword, no
+      // summary verb. Falls through to default "implement" →
+      // chain fires.
+      { userMessage: "i'd like to refactor the auth system to support multiple providers", runId: "r-llm-1" },
       stub,
     )
     expect(out.hint).toBe("implement")
@@ -127,26 +136,27 @@ describe("classifyIntentSmart — LLM chain (non-simple prompts)", () => {
     expect(stub).toHaveBeenCalledTimes(1)
   })
 
-  it("runs the chain when the regex would say `bug` (compound-noun trap)", async () => {
-    // This is the regression case PR #82 addressed with the
-    // implement-anchor regex. The LLM should ALSO classify it as
-    // implement — but via deliberate reasoning, not a brittle pattern.
+  it("runs the chain when LLM disagrees with the default-fallthrough regex verdict", async () => {
+    // The LLM corrects an ambiguous prompt away from the default
+    // "implement". This is the case where the chain genuinely adds
+    // value over the regex.
     const stub: ClassifyIntentLlmCall = vi.fn().mockResolvedValueOnce(
       stepJson({
-        paragraph: "The phrase 'error handling' is a FEATURE in the user's build request, not a bug symptom. Implement.",
+        paragraph: "User is asking for an explanation, not an implementation.",
         done: true,
-        hypothesis: "implement",
+        hypothesis: "summary",
         confidence: "HIGH",
       }),
     )
 
     const out = await classifyIntentSmart(
-      { userMessage: "the build is broken because of error handling logic", runId: "r-llm-2" },
+      // Doesn't match any specific pattern — falls through to default
+      // "implement". LLM overrides to "summary".
+      { userMessage: "i'm curious about the choice of postgres over mongo here", runId: "r-llm-2" },
       stub,
     )
     expect(out.source).toBe("chain")
-    // The LLM committed via its paragraph — the regex would have said `bug`.
-    expect(out.hint).toBe("implement")
+    expect(out.hint).toBe("summary")
     expect(stub).toHaveBeenCalledTimes(1)
   })
 
@@ -155,12 +165,60 @@ describe("classifyIntentSmart — LLM chain (non-simple prompts)", () => {
       stepJson({ paragraph: "p", done: true, hypothesis: "bug", confidence: "MEDIUM" }),
     )
 
-    await classifyIntentSmart({ userMessage: "why does X keep failing intermittently", runId: "r-cache-llm" }, stub)
+    // Default-fallthrough prompt (no specific pattern) → chain fires.
+    await classifyIntentSmart({ userMessage: "things just aren't working right around here", runId: "r-cache-llm" }, stub)
     expect(getIntentForRun("r-cache-llm")).toBe("bug")
     // Cache hit on second call — stub stays at 1.
-    const second = await classifyIntentSmart({ userMessage: "why does X keep failing intermittently", runId: "r-cache-llm" }, stub)
+    const second = await classifyIntentSmart({ userMessage: "things just aren't working right around here", runId: "r-cache-llm" }, stub)
     expect(second.source).toBe("cache")
     expect(stub).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe("classifyIntentSmart — regex_confident fast-path (Stage 3 of speed-overhaul)", () => {
+  // The new fast-path: regex matched a SPECIFIC pattern → trust it,
+  // skip the LLM chain entirely. Saves 1-6 Flash calls per non-simple
+  // prompt — the single biggest budget pressure point pre-Stage-3.
+  it("IMPLEMENT_LEAD match → regex_confident, NO chain call", async () => {
+    const stub = vi.fn()
+    const out = await classifyIntentSmart(
+      { userMessage: "build a postgres-backed user API", runId: "r-conf-1" },
+      stub,
+    )
+    expect(out.hint).toBe("implement")
+    expect(out.source).toBe("regex_confident")
+    expect(stub).not.toHaveBeenCalled()
+    expect(getIntentForRun("r-conf-1")).toBe("implement")
+  })
+
+  it("BUG_PATTERN match → regex_confident, NO chain call", async () => {
+    const stub = vi.fn()
+    const out = await classifyIntentSmart(
+      { userMessage: "fix the TypeError on line 12 of src/index.ts", runId: "r-conf-2" },
+      stub,
+    )
+    expect(out.hint).toBe("bug")
+    expect(out.source).toBe("regex_confident")
+    expect(stub).not.toHaveBeenCalled()
+  })
+
+  it("SUMMARY_PATTERN match → regex_confident, NO chain call", async () => {
+    const stub = vi.fn()
+    const out = await classifyIntentSmart(
+      { userMessage: "explain how the auth flow works", runId: "r-conf-3" },
+      stub,
+    )
+    expect(out.hint).toBe("summary")
+    expect(out.source).toBe("regex_confident")
+    expect(stub).not.toHaveBeenCalled()
+  })
+
+  it("regex_confident result caches like every other source", async () => {
+    const stub = vi.fn()
+    await classifyIntentSmart({ userMessage: "build a stripe integration", runId: "r-conf-cache" }, stub)
+    const second = await classifyIntentSmart({ userMessage: "build a stripe integration", runId: "r-conf-cache" }, stub)
+    expect(second.source).toBe("cache")
+    expect(stub).not.toHaveBeenCalled()
   })
 })
 
@@ -172,14 +230,17 @@ describe("classifyIntentSmart — regex fallback when chain returns null", () =>
 
     const stub: ClassifyIntentLlmCall = vi.fn()
     const out = await classifyIntentSmart(
-      { userMessage: "this is broken because of the typeerror", runId: "r-fb-1" },
+      // Default-fallthrough prompt (no specific pattern) so the chain
+      // IS reached, then fails → regex_fallback. Stage 3 of
+      // speed-overhaul plan changed pattern-matched prompts to
+      // skip the chain entirely (regex_confident, separate test block).
+      { userMessage: "something seems off with the project right now", runId: "r-fb-1" },
       stub,
     )
-    // Regex says `bug` for this prompt.
-    expect(out.hint).toBe("bug")
+    // Regex defaults this prompt to `implement` (no specific match).
+    expect(out.hint).toBe("implement")
     expect(out.source).toBe("regex_fallback")
-    // Cached so subsequent calls don't re-classify.
-    expect(getIntentForRun("r-fb-1")).toBe("bug")
+    expect(getIntentForRun("r-fb-1")).toBe("implement")
     // Chain never fired (pickReasonerBackend returned null).
     expect(stub).not.toHaveBeenCalled()
   })
@@ -187,10 +248,11 @@ describe("classifyIntentSmart — regex fallback when chain returns null", () =>
   it("falls back to regex when iter 1 is unparseable", async () => {
     const stub: ClassifyIntentLlmCall = vi.fn().mockResolvedValueOnce("not json")
     const out = await classifyIntentSmart(
-      { userMessage: "build a stripe integration", runId: "r-fb-2" },
+      // Default-fallthrough prompt — chain fires, returns garbage,
+      // wrapper falls back to regex.
+      { userMessage: "the existing setup seems suboptimal", runId: "r-fb-2" },
       stub,
     )
-    // Regex's implement-anchor catches the "build" verb → implement.
     expect(out.hint).toBe("implement")
     expect(out.source).toBe("regex_fallback")
   })
@@ -218,9 +280,12 @@ describe("classifyIntentSmart — caches even on regex_fallback so subsequent ca
     delete process.env.OPENROUTER_API_KEY
 
     const stub = vi.fn()
+    // "fix the broken auth" matches BUG_PATTERN → regex_confident
+    // (Stage 3 fast-path skips the LLM chain). The cache still
+    // populates, so the second call hits cache.
     await classifyIntentSmart({ userMessage: "fix the broken auth", runId: "r-fb-cache" }, stub)
     expect(getIntentForRun("r-fb-cache")).toBe("bug")
-    // Second call: cache hit (NOT regex_fallback again).
+    // Second call: cache hit.
     const second = await classifyIntentSmart({ userMessage: "fix the broken auth", runId: "r-fb-cache" }, stub)
     expect(second.source).toBe("cache")
   })
@@ -292,9 +357,11 @@ describe("classifyIntentSmart — flag off path", () => {
     // getFlag... but the test infrastructure here just relies on the
     // env-key gate (which `pickReasonerBackend` checks AFTER the flag).
     // Easier: explicitly pin an unsupported flagOverride to force null.
+    // Default-fallthrough prompt (no specific pattern) so the chain
+    // is reached; pinned backend → chain falls through to fallback.
     const stub: ClassifyIntentLlmCall = vi.fn()
     const out = await classifyIntentSmart(
-      { userMessage: "build a foo", runId: "r-flag", flagOverride: "anthropic" /* no anthropic key set */ },
+      { userMessage: "the project layout could use some attention", runId: "r-flag", flagOverride: "anthropic" /* no anthropic key set */ },
       stub,
     )
     expect(out.source).toBe("regex_fallback")

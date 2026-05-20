@@ -299,7 +299,7 @@ export interface ClientResponse {
    * rest of the run since the cache holds the value. CLI captures
    * via the same first-observation-wins pattern as `reasonerBackend`.
    */
-  intentClassificationSource?: "cache" | "regex_simple" | "regex_fallback" | "chain" | null
+  intentClassificationSource?: "cache" | "regex_simple" | "regex_confident" | "regex_fallback" | "chain" | null
   /**
    * Stage 5: the LLM chain's senior-engineer paragraphs, when
    * `intentClassificationSource === "chain"`. Surfaces in

@@ -431,9 +431,18 @@ export async function runAgent({ prompt, command = null, model = null }: RunAgen
   // Stage 5 of llm-iterative-intent-classification: capture the
   // classification source for usage.jsonl telemetry. First-observation
   // wins; constant for the rest of the run since the cache holds it.
-  let intentClassificationSource: "cache" | "regex_simple" | "regex_fallback" | "chain" | null = null
+  // Stage 3 of speed-overhaul plan (2026-05-20): added "regex_confident"
+  // — emitted when the regex matched a SPECIFIC pattern
+  // (IMPLEMENT_LEAD / BUG / SUMMARY) and the LLM chain was skipped.
+  let intentClassificationSource: "cache" | "regex_simple" | "regex_confident" | "regex_fallback" | "chain" | null = null
   const initialSource = (response as Record<string, unknown>).intentClassificationSource
-  if (initialSource === "cache" || initialSource === "regex_simple" || initialSource === "regex_fallback" || initialSource === "chain") {
+  if (
+    initialSource === "cache"
+    || initialSource === "regex_simple"
+    || initialSource === "regex_confident"
+    || initialSource === "regex_fallback"
+    || initialSource === "chain"
+  ) {
     intentClassificationSource = initialSource
   }
   // Stage 5: when the LLM iterative chain produced paragraphs, emit
