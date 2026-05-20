@@ -114,34 +114,63 @@ const SUMMARY_PATTERNS: RegExp[] = [
 ]
 
 /**
- * Synchronous regex classifier — the existing fast path. Preserved
- * unchanged so every existing caller continues to work without an
- * async migration. Exported under both `classifyIntent` (the
- * historical name) and `classifyIntentByRegex` (the explicit name
- * the new async wrapper falls back to).
+ * Plan `2026-05-18-reasoning-speed-and-rate-limit-overhaul.md` Stage 3
+ * (2026-05-20): detailed regex result. Exposes whether a SPECIFIC
+ * pattern matched the prompt or whether we fell through to the
+ * default "implement" verdict.
+ *
+ * Why this distinction matters: `classifyIntentSmart` consults the
+ * LLM chain (1-6 Flash calls) to refine the regex's guess. But when
+ * a specific pattern matched (IMPLEMENT_LEAD / BUG / SUMMARY / SIMPLE),
+ * the regex is high-confidence and the LLM rarely overrides correctly.
+ * Trusting the regex on pattern-matched prompts saves 1-6 Flash calls
+ * per non-simple prompt — the primary cost driver pre-Stage-3 for
+ * implement-class prompts like "build a POS backend with Express".
  */
-export function classifyIntent(userMessage: string): IntentHint {
+export interface IntentRegexResult {
+  hint: IntentHint
+  /** True when one of the four specific pattern arrays matched.
+   *  False when the classifier fell through to the default
+   *  `implement` verdict at the end. */
+  patternMatched: boolean
+}
+
+export function classifyIntentDetailed(userMessage: string): IntentRegexResult {
   const msg = (userMessage || "").trim()
-  if (msg.length === 0) return "simple"
+  if (msg.length === 0) return { hint: "simple", patternMatched: true }
 
   // Implement-anchor override: when the prompt opens with a strong
   // implement verb followed by something to build, classify as
   // implement BEFORE the bug check runs. Closes the regression where
   // feature-list nouns like "error handling" tripped `\berror\b` and
   // mis-routed long build prompts to the bug pipeline.
-  if (IMPLEMENT_LEAD_PATTERNS.some((re) => re.test(msg))) return "implement"
+  if (IMPLEMENT_LEAD_PATTERNS.some((re) => re.test(msg))) return { hint: "implement", patternMatched: true }
 
   // 'bug' has the highest specificity — error keywords trump anything else.
-  if (BUG_PATTERNS.some((re) => re.test(msg))) return "bug"
+  if (BUG_PATTERNS.some((re) => re.test(msg))) return { hint: "bug", patternMatched: true }
 
   // 'summary' before 'simple' — "explain X" looks shallow but needs the summary pipeline.
-  if (SUMMARY_PATTERNS.some((re) => re.test(msg))) return "summary"
+  if (SUMMARY_PATTERNS.some((re) => re.test(msg))) return { hint: "summary", patternMatched: true }
 
   // Trivial single-action prompts skip reasoning entirely.
-  if (SIMPLE_PATTERNS.some((re) => re.test(msg)) && msg.length < 80) return "simple"
+  if (SIMPLE_PATTERNS.some((re) => re.test(msg)) && msg.length < 80) return { hint: "simple", patternMatched: true }
 
-  // Default: implement pipeline.
-  return "implement"
+  // Default: implement pipeline (fall-through — no specific pattern
+  // matched, so the verdict is "least bad guess").
+  return { hint: "implement", patternMatched: false }
+}
+
+/**
+ * Synchronous regex classifier — the existing fast path. Preserved
+ * unchanged so every existing caller continues to work without an
+ * async migration. Exported under both `classifyIntent` (the
+ * historical name) and `classifyIntentByRegex` (the explicit name
+ * the new async wrapper falls back to). Thin wrapper over
+ * `classifyIntentDetailed` — discards the `patternMatched` flag
+ * for callers that only care about the verdict.
+ */
+export function classifyIntent(userMessage: string): IntentHint {
+  return classifyIntentDetailed(userMessage).hint
 }
 
 /** Alias of {@link classifyIntent} — explicit name used by the
@@ -373,7 +402,27 @@ async function defaultLlmCall(args: { backend: ReasonerBackend; systemInstructio
 // ─── Smart wrapper: cache → regex fast-path → LLM chain → regex fallback ───
 // Stage 4 entry point used by user-message.ts + tool-result.ts.
 
-export type ClassifyIntentSource = "cache" | "regex_simple" | "regex_fallback" | "chain"
+/**
+ * Where the classifier's hint came from:
+ *
+ *   - "cache"            — runId-cached value from earlier in the run.
+ *   - "regex_simple"     — fast-path: SIMPLE_PATTERNS matched (bare
+ *                          shell-style / continuation / etc.). No
+ *                          LLM call.
+ *   - "regex_confident"  — Stage 3 of speed-overhaul plan
+ *                          (2026-05-20): IMPLEMENT_LEAD / BUG / SUMMARY
+ *                          pattern matched specifically. The regex is
+ *                          high-confidence on those; no LLM call.
+ *                          Saves 1-6 Flash on every implement-class
+ *                          prompt.
+ *   - "chain"            — LLM iterative chain committed the result.
+ *                          Fires only when the regex fell through to
+ *                          the default "implement" path (no specific
+ *                          pattern matched).
+ *   - "regex_fallback"   — chain returned null / errored / flag off,
+ *                          and the regex's verdict was used.
+ */
+export type ClassifyIntentSource = "cache" | "regex_simple" | "regex_confident" | "regex_fallback" | "chain"
 
 export interface ClassifyIntentSmartArgs {
   /** The user's prompt. Same string `classifyIntent(regex)` consumes. */
@@ -453,10 +502,28 @@ export async function classifyIntentSmart(
     try { return getFlag<boolean>("reasoning.intent_classification_fast_path_regex_enabled") }
     catch { return true }
   })()
-  const regexHint = classifyIntentByRegex(args.userMessage)
+  const regex = classifyIntentDetailed(args.userMessage)
+  const regexHint = regex.hint
   if (fastPathEnabled && regexHint === "simple") {
     setIntentForRun(args.runId, regexHint)
     return { hint: regexHint, source: "regex_simple" }
+  }
+
+  // 2b. Stage 3 of speed-overhaul plan (2026-05-20):
+  //     trust the regex when a SPECIFIC pattern matched.
+  //
+  //     IMPLEMENT_LEAD / BUG / SUMMARY patterns are tight enough that
+  //     the LLM chain rarely overrides correctly — but it costs 1-6
+  //     Flash calls per prompt. For implement-class prompts ("build a
+  //     POS backend with Express"), this was the single biggest Flash
+  //     budget pressure point pre-Stage-3.
+  //
+  //     LLM chain still fires when the regex fell through to the
+  //     default "implement" verdict (patternMatched=false) — those are
+  //     the genuinely-ambiguous prompts where the chain adds value.
+  if (fastPathEnabled && regex.patternMatched) {
+    setIntentForRun(args.runId, regexHint)
+    return { hint: regexHint, source: "regex_confident" }
   }
 
   // 3. LLM chain. Flag-gated.

@@ -66,7 +66,7 @@ export interface RunSummary {
    *  for the value semantics. Captured on the first response that
    *  carries it (constant for the run); null on legacy runs where
    *  the server hasn't shipped the field yet. */
-  intentClassificationSource?: "cache" | "regex_simple" | "regex_fallback" | "chain" | null
+  intentClassificationSource?: "cache" | "regex_simple" | "regex_confident" | "regex_fallback" | "chain" | null
   /** Stage 3 of forced-error-reasoning plan: which error-reasoning
    *  path resolved the run's most-recent error.
    *    `"chain"`         — LLM iterative chain committed.
