@@ -91,23 +91,34 @@ Tests: ~4 new tests pinning the phasing (order of awaits, correct inputs to depe
 
 **Lands first because it's the highest-value-per-line-changed.**
 
-### Stage 2 — Combined `preflight_combined` pipeline (call-count win)
+### Stage 2 — Skip-when-simple + combined-when-not (call-count win, reactive shape)
 
-New pipeline with combined schema:
+**Revised 2026-05-19** to align with user's reactive-reasoning mental model: *fast by default, reason when needed, iterate*.
 
-```ts
-combinedPreflightSchema = z.object({
-  projectInit: projectInitSchema.nullable(),
-  preflight: preflightBriefSchema,
-  intent: intentBriefSchema,
-})
-```
+Two-layer gate:
 
-ONE Flash call replaces project-init + preflight + intent. The model produces all three in one structured envelope. Implement_elaborate + chunk_plan still fire after (they depend on preflight); Stage 2 doesn't merge them since their inputs differ from the upfront inputs.
+1. **Fast cheap classify** (regex/heuristic, 0 Flash). Reuses the existing `classifyIntent` regex from `intent-classifier.ts`. For obviously-simple prompts ("ls", "what's here", "yes", "continue", continuation phrases, single-file renames matching tight regex patterns) → return early before any Flash call. **Simple prompts now have 0 upfront Flash calls (was 2-4 even on the parallelized Stage 1 path).**
+2. **For non-simple prompts** — single combined Flash call:
 
-**4-19 calls → 2-3 calls.** Rate-limit pressure largely solved.
+   ```ts
+   combinedPreflightSchema = z.object({
+     projectInit: projectInitSchema.nullable(),  // omitted when not implement/empty-repo
+     preflight: preflightBriefSchema,
+     intent: intentBriefSchema,
+   })
+   ```
 
-Feature-flag gated; fallback to Stage 1's parallel path on disable. ~8 tests.
+   ONE Flash call replaces project-init + preflight + intent.
+
+Implement_elaborate + chunk_plan still fire after (they depend on preflight); Stage 2 doesn't merge them.
+
+**Effect:**
+- Simple prompts: 0 upfront Flash calls (was 2-4 even after Stage 1)
+- Non-simple prompts: 1 upfront Flash call (was 3 sequential pre-Stage-1, 3 parallel after Stage 1)
+- Chunked-loop reasoner unchanged (per-chunk planner + reflector during implementation work)
+- Reactive deeper reasoning unchanged (on-error / on-completion / off-course paths)
+
+Feature-flag gated (`reasoning.combined_preflight_call_enabled`, default true after rollout); fallback to Stage 1's parallel 3-call path on disable. ~10 tests.
 
 ### Stage 3 — Anthropic `cache_control` prompt caching
 
