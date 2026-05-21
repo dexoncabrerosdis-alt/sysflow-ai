@@ -17,6 +17,7 @@
  */
 
 import { BaseProvider } from "./base-provider.js"
+import { getFlag } from "../services/flags.js"
 import type { ProviderPayload, NormalizedResponse, TokenUsage } from "../types.js"
 
 interface AnthropicMessage {
@@ -26,6 +27,33 @@ interface AnthropicMessage {
 
 const API_URL = "https://api.anthropic.com/v1/messages"
 const ANTHROPIC_API_VERSION = "2023-06-01"
+
+/**
+ * Plan `2026-05-18-reasoning-speed-and-rate-limit-overhaul.md` Stage 4
+ * (2026-05-20): build the Anthropic `system` field as a structured
+ * content-block array with a single `cache_control` marker on the
+ * final block. This tells Anthropic's API the system prompt is
+ * cacheable; identical subsequent requests hit the cache and pay
+ * ~10% of normal input-token cost (and DON'T burn the
+ * input-tokens-per-minute rate-limit bucket as hard).
+ *
+ * The minimum cacheable size is 1024 tokens for Sonnet/Opus. The
+ * sysflow system prompt is consistently well above that threshold
+ * (instructions + project memory + reasoning briefs), so caching is
+ * always viable.
+ *
+ * Cache TTL: 5 minutes from the LATEST read. Multi-turn runs that
+ * fire several `tool-result` calls within ~5 minutes will keep the
+ * cache warm.
+ *
+ * Exported for direct tests.
+ */
+export function buildSystemForRequest(systemPrompt: string, cachingEnabled: boolean): string | Array<{ type: "text"; text: string; cache_control?: { type: "ephemeral" } }> {
+  if (!cachingEnabled || !systemPrompt) return systemPrompt
+  return [
+    { type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } },
+  ]
+}
 
 export class AnthropicProvider extends BaseProvider {
   readonly name = "Anthropic"
@@ -92,6 +120,16 @@ export class AnthropicProvider extends BaseProvider {
           const controller = new AbortController()
           const timeout = setTimeout(() => controller.abort(), 120_000)
 
+          // Stage 4 of speed-overhaul plan (2026-05-20): build the
+          // system field as a cacheable content-block array when the
+          // flag is on. Identical subsequent requests hit the cache
+          // and pay ~10% of normal input-token cost.
+          const cachingEnabled = (() => {
+            try { return getFlag<boolean>("provider.anthropic_prompt_caching_enabled") }
+            catch { return true }
+          })()
+          const systemPromptStr = this.getSystemPromptForRequest(payload)
+          const systemField = buildSystemForRequest(systemPromptStr, cachingEnabled)
           response = await fetch(API_URL, {
             method: "POST",
             headers: {
@@ -105,7 +143,7 @@ export class AnthropicProvider extends BaseProvider {
               // the model. Before this change Anthropic used the static
               // SHARED_SYSTEM_PROMPT and never saw any brief content.
               model: modelName,
-              system: this.getSystemPromptForRequest(payload),
+              system: systemField,
               messages: history,
               max_tokens: maxTokensCap,
               temperature: 0.1,
@@ -161,13 +199,40 @@ export class AnthropicProvider extends BaseProvider {
 
       const data = await response.json() as {
         content?: Array<{ type?: string; text?: string }>
-        usage?: { input_tokens?: number; output_tokens?: number }
+        usage?: {
+          input_tokens?: number
+          output_tokens?: number
+          /** Stage 4 of speed-overhaul plan (2026-05-20): Anthropic
+           *  returns this when the request CREATED a new cache entry
+           *  (the cached prompt's first request). Counts as 1.25x the
+           *  base input-token cost. */
+          cache_creation_input_tokens?: number
+          /** Stage 4: Anthropic returns this when the request HIT an
+           *  existing cache entry. Counts as 0.1x the base input-token
+           *  cost AND doesn't burn the input-tokens-per-minute bucket
+           *  as hard — the value we're chasing. */
+          cache_read_input_tokens?: number
+        }
         stop_reason?: string
       }
 
+      // Stage 4: surface cache stats. The `inputTokens` field stays
+      // as the BILLED input-token count (Anthropic's `input_tokens` is
+      // already net of cache-read savings); `generationData` exposes
+      // the raw breakdown for telemetry / cli display.
+      const cacheCreation = data.usage?.cache_creation_input_tokens ?? 0
+      const cacheRead = data.usage?.cache_read_input_tokens ?? 0
       const usage: TokenUsage = {
         inputTokens: data.usage?.input_tokens || 0,
         outputTokens: data.usage?.output_tokens || 0,
+        generationData: (cacheCreation > 0 || cacheRead > 0)
+          ? { cache_creation_input_tokens: cacheCreation, cache_read_input_tokens: cacheRead }
+          : null,
+      }
+      if (cacheRead > 0) {
+        console.log(`[anthropic] prompt-cache HIT: ${cacheRead} cached tokens (saved ~${Math.round(cacheRead * 0.9)} billed tokens)`)
+      } else if (cacheCreation > 0) {
+        console.log(`[anthropic] prompt-cache MISS: created ${cacheCreation}-token cache entry (5-min TTL)`)
       }
 
       // Anthropic returns content as an array of blocks. For text-only
