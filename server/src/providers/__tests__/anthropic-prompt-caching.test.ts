@@ -17,7 +17,7 @@
  */
 
 import { describe, it, expect } from "vitest"
-import { buildSystemForRequest } from "../anthropic.js"
+import { buildSystemForRequest, buildMessagesForRequest } from "../anthropic.js"
 
 describe("buildSystemForRequest — caching disabled (legacy string-form)", () => {
   it("returns the string verbatim when cachingEnabled=false", () => {
@@ -83,5 +83,93 @@ describe("buildSystemForRequest — feature-flag-off escape hatch", () => {
     const on = buildSystemForRequest(prompt, true) as Array<{ text: string }>
     expect(off).toBe(prompt)
     expect(on[0].text).toBe(prompt)
+  })
+})
+
+// Stage 5 of speed-overhaul plan (2026-05-21).
+describe("buildMessagesForRequest — caching disabled (legacy string-content)", () => {
+  it("returns messages with string content verbatim when cachingEnabled=false", () => {
+    const history = [
+      { role: "user" as const, content: "initial prompt + project context" },
+      { role: "assistant" as const, content: "ack" },
+      { role: "user" as const, content: "tool result 1" },
+    ]
+    const result = buildMessagesForRequest(history, false)
+    expect(result).toHaveLength(3)
+    expect(result[0].content).toBe("initial prompt + project context")
+    expect(result[1].content).toBe("ack")
+    expect(result[2].content).toBe("tool result 1")
+  })
+
+  it("returns empty array on empty history", () => {
+    expect(buildMessagesForRequest([], true)).toEqual([])
+    expect(buildMessagesForRequest([], false)).toEqual([])
+  })
+})
+
+describe("buildMessagesForRequest — caching enabled (messages[0] gets a cache marker)", () => {
+  it("converts messages[0].content to a single-block cacheable array", () => {
+    const history = [
+      { role: "user" as const, content: "initial prompt + project context" },
+      { role: "assistant" as const, content: "ack" },
+    ]
+    const result = buildMessagesForRequest(history, true)
+    expect(Array.isArray(result[0].content)).toBe(true)
+    const blocks = result[0].content as Array<{ type: string; text: string; cache_control?: { type: string } }>
+    expect(blocks).toHaveLength(1)
+    expect(blocks[0].type).toBe("text")
+    expect(blocks[0].text).toBe("initial prompt + project context")
+    expect(blocks[0].cache_control).toEqual({ type: "ephemeral" })
+  })
+
+  it("only messages[0] gets cached; subsequent messages keep string content", () => {
+    // Assistant responses + tool results vary turn-to-turn; caching
+    // them is wasteful (cache miss every call). Only the stable
+    // first message benefits from caching.
+    const history = [
+      { role: "user" as const, content: "initial" },
+      { role: "assistant" as const, content: "response 1" },
+      { role: "user" as const, content: "tool result 1" },
+      { role: "assistant" as const, content: "response 2" },
+      { role: "user" as const, content: "tool result 2" },
+    ]
+    const result = buildMessagesForRequest(history, true)
+    expect(Array.isArray(result[0].content)).toBe(true)
+    expect(typeof result[1].content).toBe("string")
+    expect(typeof result[2].content).toBe("string")
+    expect(typeof result[3].content).toBe("string")
+    expect(typeof result[4].content).toBe("string")
+  })
+
+  it("does NOT mutate the input history (returns a new array)", () => {
+    const original = [
+      { role: "user" as const, content: "initial" },
+    ]
+    const result = buildMessagesForRequest(original, true)
+    // Input should be unchanged.
+    expect(typeof original[0].content).toBe("string")
+    expect(original[0].content).toBe("initial")
+    // Output should have the cached shape.
+    expect(Array.isArray(result[0].content)).toBe(true)
+  })
+
+  it("empty-string content on messages[0] is NOT wrapped (defensive — no point caching empty)", () => {
+    // The provider always builds a non-empty initial user message,
+    // but guard defensively against the empty case.
+    const history = [
+      { role: "user" as const, content: "" },
+    ]
+    const result = buildMessagesForRequest(history, true)
+    expect(result[0].content).toBe("")
+  })
+
+  it("single-turn history (just messages[0]) still gets the marker (creates cache for future turns)", () => {
+    const history = [
+      { role: "user" as const, content: "initial prompt only" },
+    ]
+    const result = buildMessagesForRequest(history, true)
+    expect(Array.isArray(result[0].content)).toBe(true)
+    const blocks = result[0].content as Array<{ cache_control?: unknown }>
+    expect(blocks[0].cache_control).toBeTruthy()
   })
 })

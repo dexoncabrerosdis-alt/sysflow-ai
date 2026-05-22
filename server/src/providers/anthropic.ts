@@ -55,6 +55,48 @@ export function buildSystemForRequest(systemPrompt: string, cachingEnabled: bool
   ]
 }
 
+/**
+ * Plan `2026-05-18-reasoning-speed-and-rate-limit-overhaul.md` Stage 5
+ * (2026-05-21): also mark the INITIAL user message as cacheable.
+ *
+ * The first user message contains the LARGE-and-STABLE content: the
+ * project directory tree, project memory, project knowledge, frontend
+ * patterns, the initial user prompt. It's built once by
+ * `buildInitialUserMessage` and stays in the conversation history
+ * for the rest of the run. Every subsequent tool-result turn re-sends
+ * the full history (including messages[0]), so caching it means
+ * turn 2+ pays ~10% of normal input-token cost on that prefix.
+ *
+ * Anthropic allows up to 4 `cache_control` breakpoints per request.
+ * Stage 4 used 1 (on the system prompt); Stage 5 adds a 2nd (on
+ * messages[0]). Together they cover the bulk of the per-turn input
+ * tokens on multi-turn runs.
+ *
+ * Pure helper — does NOT mutate the input array. Returns a new array
+ * with the first message's content transformed to the cacheable
+ * content-block shape when caching is enabled.
+ */
+type CachedTextBlock = { type: "text"; text: string; cache_control?: { type: "ephemeral" } }
+export function buildMessagesForRequest(
+  history: AnthropicMessage[],
+  cachingEnabled: boolean,
+): Array<{ role: "user" | "assistant"; content: string | CachedTextBlock[] }> {
+  if (!cachingEnabled || history.length === 0) {
+    return history.map((m) => ({ role: m.role, content: m.content }))
+  }
+  return history.map((m, i) => {
+    if (i === 0 && typeof m.content === "string" && m.content.length > 0) {
+      return {
+        role: m.role,
+        content: [
+          { type: "text" as const, text: m.content, cache_control: { type: "ephemeral" as const } },
+        ],
+      }
+    }
+    return { role: m.role, content: m.content }
+  })
+}
+
 export class AnthropicProvider extends BaseProvider {
   readonly name = "Anthropic"
 
@@ -130,6 +172,13 @@ export class AnthropicProvider extends BaseProvider {
           })()
           const systemPromptStr = this.getSystemPromptForRequest(payload)
           const systemField = buildSystemForRequest(systemPromptStr, cachingEnabled)
+          // Stage 5 of speed-overhaul plan (2026-05-21): also mark the
+          // INITIAL user message as cacheable. It contains the largest
+          // and most stable per-run content (project dir tree + memory
+          // + knowledge + initial prompt) and stays in history for
+          // every subsequent turn. Caching it means turn 2+ hits cache
+          // on that prefix too — ~10% of normal cost vs ~100%.
+          const messagesField = buildMessagesForRequest(history!, cachingEnabled)
           response = await fetch(API_URL, {
             method: "POST",
             headers: {
@@ -144,7 +193,7 @@ export class AnthropicProvider extends BaseProvider {
               // SHARED_SYSTEM_PROMPT and never saw any brief content.
               model: modelName,
               system: systemField,
-              messages: history,
+              messages: messagesField,
               max_tokens: maxTokensCap,
               temperature: 0.1,
             }),
