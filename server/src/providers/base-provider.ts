@@ -353,6 +353,33 @@ export abstract class BaseProvider {
    * of memory flow. Future work can centralise the async-discovery path.
    */
   getSystemPromptForRequest(payload: ProviderPayload): string {
+    return this.buildPromptCtx(payload, "full")
+  }
+
+  /**
+   * Stage 5b of speed-overhaul plan (2026-05-26): expose the
+   * stable + dynamic split of the system prompt so providers that
+   * support prompt caching (Anthropic) can put `cache_control` on
+   * the stable prefix only. Sections in `prompt/build.ts` are already
+   * classified `cacheable: true|false` — this method just surfaces
+   * the two halves to the provider.
+   *
+   * Stage 4 cached the FULL system prompt as one block — which silently
+   * missed cache reads on every turn because the dynamic suffix
+   * (reasoning briefs, task ledger, project-state) changes per turn.
+   * With this split, the cacheable prefix stays byte-stable across the
+   * run's turns and gets reliable cache hits.
+   */
+  getSystemPromptPartsForRequest(payload: ProviderPayload): { cacheable: string; dynamic: string } {
+    const cacheable = this.buildPromptCtx(payload, "cacheable")
+    const dynamic = this.buildPromptCtx(payload, "dynamic")
+    return { cacheable, dynamic }
+  }
+
+  /** Internal shared builder for the two public methods above. Returns
+   *  the requested portion (`full` | `cacheable` | `dynamic`) of the
+   *  system prompt; the underlying section assembly is the same. */
+  private buildPromptCtx(payload: ProviderPayload, part: "full" | "cacheable" | "dynamic"): string {
     // Phase 18 Stage 5: resolve the taskPlan-emission flag once per
     // request. Default `true` (gate on); flag-off path lets operators
     // restore the pre-Phase-18 always-include behaviour without code
@@ -362,7 +389,7 @@ export abstract class BaseProvider {
       catch { return true }
     })()
 
-    return getSystemPrompt({
+    const built = buildSystemPrompt({
       model: payload.model,
       cwd: payload.cwd,
       planMode: payload.planMode,
@@ -393,6 +420,7 @@ export abstract class BaseProvider {
       // `Get-ChildItem -Force`.
       platform: payload.clientPlatform,
     })
+    return built[part]
   }
 
   clearRunState(runId: string): void {

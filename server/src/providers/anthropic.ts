@@ -31,50 +31,90 @@ const ANTHROPIC_API_VERSION = "2023-06-01"
 /**
  * Plan `2026-05-18-reasoning-speed-and-rate-limit-overhaul.md` Stage 4
  * (2026-05-20): build the Anthropic `system` field as a structured
- * content-block array with a single `cache_control` marker on the
- * final block. This tells Anthropic's API the system prompt is
- * cacheable; identical subsequent requests hit the cache and pay
- * ~10% of normal input-token cost (and DON'T burn the
- * input-tokens-per-minute rate-limit bucket as hard).
+ * content-block array with a `cache_control` marker so identical
+ * subsequent requests hit the cache and pay ~10% of normal input-
+ * token cost (and DON'T burn the input-tokens-per-minute rate-limit
+ * bucket as hard).
  *
- * The minimum cacheable size is 1024 tokens for Sonnet/Opus. The
- * sysflow system prompt is consistently well above that threshold
- * (instructions + project memory + reasoning briefs), so caching is
- * always viable.
+ * Stage 5b (2026-05-26): split the prompt into a STABLE prefix +
+ * DYNAMIC suffix and mark only the prefix as cacheable. Sections in
+ * `prompt/build.ts` are already classified `cacheable: true|false`;
+ * we surface the two halves via `getSystemPromptPartsForRequest` and
+ * build them into TWO blocks here:
  *
- * Cache TTL: 5 minutes from the LATEST read. Multi-turn runs that
- * fire several `tool-result` calls within ~5 minutes will keep the
- * cache warm.
+ *   [
+ *     { type: "text", text: cacheable_prefix, cache_control: ... },
+ *     { type: "text", text: dynamic_suffix }                       ← no marker
+ *   ]
+ *
+ * Anthropic's cache stores everything UP TO AND INCLUDING the marked
+ * block; the dynamic suffix changes per turn but doesn't invalidate
+ * the cacheable prefix. Pre-Stage-5b the full prompt was one block —
+ * any byte change in the dynamic portion silently invalidated the
+ * whole cache.
+ *
+ * Minimum cacheable size (Anthropic docs): 1024 tokens on Sonnet
+ * 4.5; 2048 on Sonnet 4.6; 4096 on Opus 4.6/4.7 + Haiku 4.5. Below
+ * the threshold the marker is silently ignored — verify via the
+ * `cache_creation_input_tokens` log.
+ *
+ * Cache TTL: 5 minutes from latest read.
+ *
+ * `cacheablePrefix` may be empty (e.g. all dynamic sections, unusual
+ * runs) → returns a string fallback. `dynamicSuffix` may be empty
+ * (the common case after Stage 5b is stable) → returns a single
+ * cacheable block.
  *
  * Exported for direct tests.
  */
-export function buildSystemForRequest(systemPrompt: string, cachingEnabled: boolean): string | Array<{ type: "text"; text: string; cache_control?: { type: "ephemeral" } }> {
-  if (!cachingEnabled || !systemPrompt) return systemPrompt
+export function buildSystemForRequest(
+  parts: { cacheable: string; dynamic: string },
+  cachingEnabled: boolean,
+): string | Array<{ type: "text"; text: string; cache_control?: { type: "ephemeral" } }> {
+  const { cacheable, dynamic } = parts
+  // Concatenation that handles the three empty-half cases:
+  //   both empty   → ""
+  //   only one set → that half verbatim
+  //   both set     → joined with a paragraph break
+  const fullText = cacheable && dynamic ? `${cacheable}\n\n${dynamic}` : (cacheable || dynamic)
+  if (!cachingEnabled || !cacheable) return fullText
+  if (!dynamic) {
+    return [{ type: "text", text: cacheable, cache_control: { type: "ephemeral" } }]
+  }
   return [
-    { type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } },
+    { type: "text", text: cacheable, cache_control: { type: "ephemeral" } },
+    { type: "text", text: dynamic },
   ]
 }
 
 /**
  * Plan `2026-05-18-reasoning-speed-and-rate-limit-overhaul.md` Stage 5
- * (2026-05-21): also mark the INITIAL user message as cacheable.
+ * (2026-05-21): mark the INITIAL user message as cacheable.
  *
- * The first user message contains the LARGE-and-STABLE content: the
- * project directory tree, project memory, project knowledge, frontend
- * patterns, the initial user prompt. It's built once by
- * `buildInitialUserMessage` and stays in the conversation history
- * for the rest of the run. Every subsequent tool-result turn re-sends
- * the full history (including messages[0]), so caching it means
- * turn 2+ pays ~10% of normal input-token cost on that prefix.
+ * Stage 5b (2026-05-26): ALSO add a 3rd `cache_control` breakpoint
+ * on the LAST message in history — the most-recently-appended user/
+ * tool_result turn. This is the rolling-conversation cache pattern
+ * Anthropic's docs document explicitly:
  *
- * Anthropic allows up to 4 `cache_control` breakpoints per request.
- * Stage 4 used 1 (on the system prompt); Stage 5 adds a 2nd (on
- * messages[0]). Together they cover the bulk of the per-turn input
- * tokens on multi-turn runs.
+ *   "Put a breakpoint on the last content block of the most-recently-
+ *    appended turn. Each subsequent request reuses the entire prior
+ *    conversation prefix."
  *
- * Pure helper — does NOT mutate the input array. Returns a new array
- * with the first message's content transformed to the cacheable
- * content-block shape when caching is enabled.
+ * Effect: turn N+1's cache lookup finds the cache entry written on
+ * turn N, reads the entire conversation prefix up through turn N
+ * (which is everything except the new tool_result + assistant turn),
+ * and only the new content gets billed at full price. On a 15-turn
+ * agentic loop this is the biggest single multi-turn cache win.
+ *
+ * Breakpoint budget (max 4 per Anthropic):
+ *   1: cacheable system prefix (Stage 5b)
+ *   2: messages[0] — initial user message (Stage 5)
+ *   3: messages[last] — rolling conversation (Stage 5b)
+ *
+ * One breakpoint still available for future use (e.g. mid-conversation
+ * documents or large tool outputs).
+ *
+ * Pure helper — does NOT mutate the input array.
  */
 type CachedTextBlock = { type: "text"; text: string; cache_control?: { type: "ephemeral" } }
 export function buildMessagesForRequest(
@@ -84,8 +124,14 @@ export function buildMessagesForRequest(
   if (!cachingEnabled || history.length === 0) {
     return history.map((m) => ({ role: m.role, content: m.content }))
   }
+  const lastIdx = history.length - 1
   return history.map((m, i) => {
-    if (i === 0 && typeof m.content === "string" && m.content.length > 0) {
+    // Both breakpoints (messages[0] and messages[last]) use the same
+    // shape — wrap content in a single text block with cache_control.
+    // For single-turn history (lastIdx === 0), one marker is applied
+    // (the message acts as both messages[0] and messages[last]).
+    const shouldCache = (i === 0 || i === lastIdx) && typeof m.content === "string" && m.content.length > 0
+    if (shouldCache) {
       return {
         role: m.role,
         content: [
@@ -170,8 +216,14 @@ export class AnthropicProvider extends BaseProvider {
             try { return getFlag<boolean>("provider.anthropic_prompt_caching_enabled") }
             catch { return true }
           })()
-          const systemPromptStr = this.getSystemPromptForRequest(payload)
-          const systemField = buildSystemForRequest(systemPromptStr, cachingEnabled)
+          // Stage 5b (2026-05-26): use the split (cacheable + dynamic)
+          // parts instead of the full prompt so cache_control only
+          // marks the byte-stable prefix. Stage 4 cached the full
+          // prompt, which silently invalidated on every turn because
+          // the dynamic sections (reasoning briefs, task ledger,
+          // project-state) change turn-over-turn.
+          const systemParts = this.getSystemPromptPartsForRequest(payload)
+          const systemField = buildSystemForRequest(systemParts, cachingEnabled)
           // Stage 5 of speed-overhaul plan (2026-05-21): also mark the
           // INITIAL user message as cacheable. It contains the largest
           // and most stable per-run content (project dir tree + memory
