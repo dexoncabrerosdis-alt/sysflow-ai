@@ -1,92 +1,117 @@
 /**
- * Plan `2026-05-18-reasoning-speed-and-rate-limit-overhaul.md` Stage 4
- * (2026-05-20). Pins the Anthropic prompt-caching contract.
+ * Plan `2026-05-18-reasoning-speed-and-rate-limit-overhaul.md`
+ * Stages 4 (2026-05-20), 5 (2026-05-21), and 5b (2026-05-26).
  *
- * The change in `anthropic.ts`:
+ * Pins the Anthropic prompt-caching contract.
  *
- *   - When `provider.anthropic_prompt_caching_enabled` is on (default),
- *     the `system` field in the request body is built as a structured
- *     content-block array with a `cache_control: { type: "ephemeral" }`
- *     marker on the final block.
- *   - When the flag is off (or the system prompt is empty), the legacy
- *     string-form `system` is sent as-is.
+ * Stage 4: system field is a cacheable content-block array.
+ * Stage 5: messages[0] also gets a cache_control marker.
+ * Stage 5b: system splits into stable + dynamic (cache only the stable
+ * half); messages[last] gets a 3rd cache_control marker for rolling
+ * conversation cache.
  *
- * Testing the full provider requires mocking `fetch` + the run-state
- * machinery. The pure helper `buildSystemForRequest` is what the
- * provider calls; this suite pins it directly.
+ * `buildSystemForRequest` and `buildMessagesForRequest` are pure
+ * helpers that don't need the full provider stack; this suite tests
+ * them directly. The actual fetch + caching behavior is verified
+ * manually against Anthropic by inspecting `cache_read_input_tokens`
+ * on response usage.
  */
 
 import { describe, it, expect } from "vitest"
 import { buildSystemForRequest, buildMessagesForRequest } from "../anthropic.js"
 
-describe("buildSystemForRequest — caching disabled (legacy string-form)", () => {
-  it("returns the string verbatim when cachingEnabled=false", () => {
-    const prompt = "You are a coding agent. Follow these rules..."
-    const result = buildSystemForRequest(prompt, false)
-    expect(result).toBe(prompt)
+describe("buildSystemForRequest — caching disabled", () => {
+  it("returns the concatenated full text when cachingEnabled=false", () => {
+    const result = buildSystemForRequest({ cacheable: "stable", dynamic: "dynamic" }, false)
+    expect(result).toBe("stable\n\ndynamic")
   })
 
-  it("returns empty string verbatim (no caching for empty prompts)", () => {
-    expect(buildSystemForRequest("", true)).toBe("")
-    expect(buildSystemForRequest("", false)).toBe("")
+  it("returns just cacheable when no dynamic suffix", () => {
+    const result = buildSystemForRequest({ cacheable: "only stable", dynamic: "" }, false)
+    expect(result).toBe("only stable")
+  })
+
+  it("returns empty string when both parts are empty", () => {
+    expect(buildSystemForRequest({ cacheable: "", dynamic: "" }, true)).toBe("")
+    expect(buildSystemForRequest({ cacheable: "", dynamic: "" }, false)).toBe("")
   })
 })
 
-describe("buildSystemForRequest — caching enabled (content-block array)", () => {
-  it("converts a non-empty string into a single-block array with cache_control on the last (only) block", () => {
-    const prompt = "You are a coding agent. Long system prompt with project memory + reasoning briefs..."
-    const result = buildSystemForRequest(prompt, true) as Array<{ type: string; text: string; cache_control?: { type: string } }>
+describe("buildSystemForRequest — caching enabled (Stage 5b stable/dynamic split)", () => {
+  it("when both halves are present: returns TWO blocks; cache_control on the CACHEABLE block only", () => {
+    const result = buildSystemForRequest(
+      { cacheable: "stable system instructions", dynamic: "per-turn reasoning briefs" },
+      true,
+    ) as Array<{ type: string; text: string; cache_control?: { type: string } }>
     expect(Array.isArray(result)).toBe(true)
-    expect(result).toHaveLength(1)
+    expect(result).toHaveLength(2)
+    // Block 0: cacheable prefix WITH marker
     expect(result[0].type).toBe("text")
-    expect(result[0].text).toBe(prompt)
+    expect(result[0].text).toBe("stable system instructions")
+    expect(result[0].cache_control).toEqual({ type: "ephemeral" })
+    // Block 1: dynamic suffix WITHOUT marker
+    expect(result[1].type).toBe("text")
+    expect(result[1].text).toBe("per-turn reasoning briefs")
+    expect(result[1].cache_control).toBeUndefined()
+  })
+
+  it("when only cacheable is present: returns single-block array with marker", () => {
+    const result = buildSystemForRequest(
+      { cacheable: "stable only", dynamic: "" },
+      true,
+    ) as Array<{ type: string; text: string; cache_control?: { type: string } }>
+    expect(result).toHaveLength(1)
+    expect(result[0].text).toBe("stable only")
     expect(result[0].cache_control).toEqual({ type: "ephemeral" })
   })
 
-  it("preserves the FULL prompt text inside the cached block (no truncation)", () => {
-    // The system prompt can be 5k-20k tokens long. We must not slice
-    // or summarize it — Anthropic caches the verbatim block content.
-    const prompt = "x".repeat(50_000)
-    const result = buildSystemForRequest(prompt, true) as Array<{ text: string }>
-    expect(result[0].text).toHaveLength(50_000)
+  it("when only dynamic is present (no cacheable): returns the dynamic string verbatim (no caching possible)", () => {
+    // Edge case: all sections classified non-cacheable. Nothing to
+    // cache — fall through to the unwrapped string so the request
+    // still goes out with a system field.
+    const result = buildSystemForRequest({ cacheable: "", dynamic: "all dynamic" }, true)
+    expect(result).toBe("all dynamic")
   })
 
-  it("marker is on the LAST cacheable block (Anthropic caches the prefix up to and including the marker)", () => {
-    // Today the helper produces ONE block, so the last block == the
-    // only block. This test pins the invariant for future refactors
-    // that might split the system into multiple cacheable segments
-    // (e.g. static-instructions block + dynamic-briefs block).
-    const prompt = "stable instructions + dynamic briefs"
-    const result = buildSystemForRequest(prompt, true) as Array<{ cache_control?: unknown }>
-    const lastBlock = result[result.length - 1]
-    expect(lastBlock.cache_control).toBeTruthy()
+  it("preserves the FULL text of both halves (no truncation)", () => {
+    const cacheable = "x".repeat(20_000)
+    const dynamic = "y".repeat(10_000)
+    const result = buildSystemForRequest({ cacheable, dynamic }, true) as Array<{ text: string }>
+    expect(result[0].text).toHaveLength(20_000)
+    expect(result[1].text).toHaveLength(10_000)
   })
 
-  it("returned shape matches Anthropic's documented content-block schema", () => {
-    const prompt = "test"
-    const result = buildSystemForRequest(prompt, true) as Array<Record<string, unknown>>
-    // Per https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching:
-    //   { type: "text", text: "...", cache_control: { type: "ephemeral" } }
+  it("returned cacheable block shape matches Anthropic's documented schema", () => {
+    const result = buildSystemForRequest(
+      { cacheable: "x", dynamic: "y" },
+      true,
+    ) as Array<Record<string, unknown>>
     expect(Object.keys(result[0]).sort()).toEqual(["cache_control", "text", "type"])
+  })
+
+  it("dynamic block has NO cache_control key (not just undefined — actually absent)", () => {
+    // Pins that a future regression that adds cache_control: undefined
+    // to the dynamic block still passes a structural check. The block
+    // should be a clean {type, text} pair.
+    const result = buildSystemForRequest(
+      { cacheable: "x", dynamic: "y" },
+      true,
+    ) as Array<Record<string, unknown>>
+    expect(Object.keys(result[1]).sort()).toEqual(["text", "type"])
   })
 })
 
 describe("buildSystemForRequest — feature-flag-off escape hatch", () => {
-  it("operators can disable caching at runtime (the provider reads the flag each call)", () => {
-    // The actual flag-read happens inside anthropic.ts's provider
-    // call — this pins that the disabled path is non-destructive
-    // (just returns the original string). If a regression in
-    // Anthropic's caching beta breaks responses, operators flip the
-    // flag and the provider reverts to the legacy string-form.
-    const prompt = "the instructions"
-    const off = buildSystemForRequest(prompt, false)
-    const on = buildSystemForRequest(prompt, true) as Array<{ text: string }>
-    expect(off).toBe(prompt)
-    expect(on[0].text).toBe(prompt)
+  it("operators can disable caching at runtime; output reverts to a single concatenated string", () => {
+    const parts = { cacheable: "the instructions", dynamic: "briefs go here" }
+    const off = buildSystemForRequest(parts, false)
+    const on = buildSystemForRequest(parts, true) as Array<{ text: string }>
+    expect(off).toBe("the instructions\n\nbriefs go here")
+    expect(on[0].text).toBe("the instructions")
+    expect(on[1].text).toBe("briefs go here")
   })
 })
 
-// Stage 5 of speed-overhaul plan (2026-05-21).
 describe("buildMessagesForRequest — caching disabled (legacy string-content)", () => {
   it("returns messages with string content verbatim when cachingEnabled=false", () => {
     const history = [
@@ -107,25 +132,8 @@ describe("buildMessagesForRequest — caching disabled (legacy string-content)",
   })
 })
 
-describe("buildMessagesForRequest — caching enabled (messages[0] gets a cache marker)", () => {
-  it("converts messages[0].content to a single-block cacheable array", () => {
-    const history = [
-      { role: "user" as const, content: "initial prompt + project context" },
-      { role: "assistant" as const, content: "ack" },
-    ]
-    const result = buildMessagesForRequest(history, true)
-    expect(Array.isArray(result[0].content)).toBe(true)
-    const blocks = result[0].content as Array<{ type: string; text: string; cache_control?: { type: string } }>
-    expect(blocks).toHaveLength(1)
-    expect(blocks[0].type).toBe("text")
-    expect(blocks[0].text).toBe("initial prompt + project context")
-    expect(blocks[0].cache_control).toEqual({ type: "ephemeral" })
-  })
-
-  it("only messages[0] gets cached; subsequent messages keep string content", () => {
-    // Assistant responses + tool results vary turn-to-turn; caching
-    // them is wasteful (cache miss every call). Only the stable
-    // first message benefits from caching.
+describe("buildMessagesForRequest — Stage 5 (messages[0]) + Stage 5b (messages[last])", () => {
+  it("multi-turn: BOTH messages[0] AND messages[last] get cache_control markers; middle messages stay string", () => {
     const history = [
       { role: "user" as const, content: "initial" },
       { role: "assistant" as const, content: "response 1" },
@@ -134,42 +142,83 @@ describe("buildMessagesForRequest — caching enabled (messages[0] gets a cache 
       { role: "user" as const, content: "tool result 2" },
     ]
     const result = buildMessagesForRequest(history, true)
+    // messages[0] cached
     expect(Array.isArray(result[0].content)).toBe(true)
+    expect((result[0].content as Array<{ cache_control?: unknown }>)[0].cache_control).toBeTruthy()
+    // middle messages stay string
     expect(typeof result[1].content).toBe("string")
     expect(typeof result[2].content).toBe("string")
     expect(typeof result[3].content).toBe("string")
-    expect(typeof result[4].content).toBe("string")
+    // messages[last] cached (Stage 5b — rolling conversation cache)
+    expect(Array.isArray(result[4].content)).toBe(true)
+    expect((result[4].content as Array<{ cache_control?: unknown }>)[0].cache_control).toBeTruthy()
+  })
+
+  it("single-turn (history.length === 1): one marker only (messages[0] === messages[last])", () => {
+    const history = [{ role: "user" as const, content: "initial prompt only" }]
+    const result = buildMessagesForRequest(history, true)
+    expect(Array.isArray(result[0].content)).toBe(true)
+    const blocks = result[0].content as Array<{ cache_control?: unknown }>
+    expect(blocks).toHaveLength(1)
+    expect(blocks[0].cache_control).toBeTruthy()
+  })
+
+  it("two-turn: marker on messages[0] and on messages[1] (the new turn)", () => {
+    // Most common steady-state shape for sysflow: initial + tool_result.
+    const history = [
+      { role: "user" as const, content: "initial" },
+      { role: "user" as const, content: "tool_result" },
+    ]
+    const result = buildMessagesForRequest(history, true)
+    expect(Array.isArray(result[0].content)).toBe(true)
+    expect(Array.isArray(result[1].content)).toBe(true)
   })
 
   it("does NOT mutate the input history (returns a new array)", () => {
     const original = [
       { role: "user" as const, content: "initial" },
+      { role: "assistant" as const, content: "response" },
+      { role: "user" as const, content: "follow-up" },
     ]
     const result = buildMessagesForRequest(original, true)
-    // Input should be unchanged.
     expect(typeof original[0].content).toBe("string")
-    expect(original[0].content).toBe("initial")
-    // Output should have the cached shape.
+    expect(typeof original[1].content).toBe("string")
+    expect(typeof original[2].content).toBe("string")
     expect(Array.isArray(result[0].content)).toBe(true)
+    expect(typeof result[1].content).toBe("string")
+    expect(Array.isArray(result[2].content)).toBe(true)
   })
 
-  it("empty-string content on messages[0] is NOT wrapped (defensive — no point caching empty)", () => {
-    // The provider always builds a non-empty initial user message,
-    // but guard defensively against the empty case.
+  it("empty-string content on messages[0] or messages[last] is NOT wrapped (defensive)", () => {
     const history = [
+      { role: "user" as const, content: "" },
+      { role: "assistant" as const, content: "response" },
       { role: "user" as const, content: "" },
     ]
     const result = buildMessagesForRequest(history, true)
+    // Both endpoint messages have empty content → stay as string
     expect(result[0].content).toBe("")
+    expect(result[2].content).toBe("")
   })
 
-  it("single-turn history (just messages[0]) still gets the marker (creates cache for future turns)", () => {
+  it("breakpoint count never exceeds Anthropic's max of 4 per request (1 system + max 2 here = 3 total)", () => {
+    // Sanity guard against a future refactor adding more markers.
     const history = [
-      { role: "user" as const, content: "initial prompt only" },
+      { role: "user" as const, content: "msg0" },
+      { role: "assistant" as const, content: "a1" },
+      { role: "user" as const, content: "msg2" },
+      { role: "assistant" as const, content: "a3" },
+      { role: "user" as const, content: "msg4" },
     ]
     const result = buildMessagesForRequest(history, true)
-    expect(Array.isArray(result[0].content)).toBe(true)
-    const blocks = result[0].content as Array<{ cache_control?: unknown }>
-    expect(blocks[0].cache_control).toBeTruthy()
+    let markers = 0
+    for (const m of result) {
+      if (Array.isArray(m.content)) {
+        for (const block of m.content) {
+          if (block.cache_control) markers++
+        }
+      }
+    }
+    expect(markers).toBe(2) // messages[0] + messages[last]
   })
 })
